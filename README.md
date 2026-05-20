@@ -1,5 +1,9 @@
 # Agentic IRC Bot
 
+![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)
+![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
+![Status: pre-1.0](https://img.shields.io/badge/status-pre--1.0-orange.svg)
+
 A from-scratch agentic IRC bot in Python. The LLM is the orchestrator: it
 decides which tools to call, when to call them, and how to combine results
 into a reply. The bot has its own initiative (chimes in unprompted in

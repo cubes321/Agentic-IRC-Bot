@@ -14,6 +14,18 @@ import signal
 import sys
 from pathlib import Path
 
+# Python version check. Must fire BEFORE any import that needs 3.11+ —
+# `bot/config.py` does `import tomllib` (stdlib, added 3.11), which would
+# raise a cryptic ImportError on older Python. Bail with a friendly message
+# instead. Kept lightweight so it doesn't slow normal startup.
+if sys.version_info < (3, 11):
+    sys.stderr.write(
+        "Agentic IRC Bot requires Python 3.11 or newer "
+        f"(you have {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}).\n"
+        "Install a newer Python and re-run.\n"
+    )
+    sys.exit(1)
+
 import httpx
 from openai import AsyncOpenAI
 

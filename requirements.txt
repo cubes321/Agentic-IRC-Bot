@@ -1,3 +1,6 @@
+# Requires Python 3.11+ (uses stdlib `tomllib` and PEP 604 union syntax).
+# A runtime check in bot/main.py enforces this with a friendly message.
+
 pydle>=1.0.1
 openai>=1.40
 httpx>=0.27
