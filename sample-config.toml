@@ -1,0 +1,141 @@
+# Sample configuration for the agentic IRC bot.
+# Copy this file, edit it, and pass the path as the first CLI argument:
+#   python -m bot.main config.toml
+
+[server]
+host = "irc.quakenet.org"
+port = 6667
+tls = false
+nick = "MyBot"
+realname = "Agentic IRC Bot"
+# Channels to JOIN at startup. The bot also auto-joins any channel that has a
+# [channels."#name"] policy section below, so listing them here is OPTIONAL —
+# this list is only useful for channels you want to join with default policy.
+# Omit a channel from BOTH places if you only want to join it after /invite.
+channels = ["#myhouse", "##python"]
+
+[server.quakenet]
+# Q-bot authentication (Quakenet only). Leave q_account empty to skip Q AUTH.
+q_account = ""
+# Path to a file containing the Q password (one line, no quotes, no trailing
+# whitespace). Windows users: use SINGLE quotes for the path so backslashes
+# stay literal, e.g.  q_password_file = 'C:\path\to\qpass.txt'
+# Or use forward slashes inside double quotes:
+#                     q_password_file = "C:/path/to/qpass.txt"
+q_password_file = ""
+auto_request_x = true          # request +x to mask hostname
+
+[ai]
+base_url = "http://localhost:1234/v1"
+api_key = "lm-studio"          # LM Studio ignores this but the SDK requires non-empty
+chat_model = "qwen2.5-7b-instruct"
+embed_model = "text-embedding-nomic-embed-text-v1.5@f16"
+vision_model = "qwen2.5-vl-7b-instruct"
+vision_base_url = ""           # optional override; defaults to base_url
+
+[tools]
+search_provider = "brave"      # brave | duckduckgo | tavily
+search_fallback = "duckduckgo" # tried once on primary failure
+brave_api_key = ""
+tavily_api_key = ""
+
+[operator]
+accounts = []                  # Q accounts with admin everywhere, e.g. ["operator_account"]
+
+[budgets]
+reply_step_cap = 6
+reply_wall_sec = 90              # per-turn budget; bump up for slower local models
+task_step_cap = 30
+task_wall_sec = 1800             # 30 min, matches the "medium horizon" task budget
+llm_call_timeout_sec = 90        # per-call HTTP timeout; independent of the per-turn budget
+# Cap on concurrent chat-completion calls to the LLM (shared across replies,
+# extractor, initiative ticks). LM Studio handles 2-3 concurrent OK; raise if
+# your hardware is comfortable, lower to serialise.
+max_concurrent_chat_calls = 2
+
+[scheduler]
+# How often to poll the reminders table for due rows. 10s is fine for "remind
+# me in 5 minutes"-type reminders; lower for higher precision.
+reminder_poll_sec = 10
+# Random jitter on per-channel tick intervals. 0.20 = ±20%, so a tick_interval
+# of 90s actually fires somewhere in [72s, 108s]. Avoids multiple channels'
+# ticks lining up on the same second.
+tick_jitter_pct = 0.20
+# Floor on per-channel tick_interval_sec. A mistyped `tick_interval_sec = 5`
+# would generate ~17K LLM calls/day per channel. This catches that.
+min_tick_interval_sec = 60
+# Buffer-window cutoff: messages older than this are excluded from the tick
+# prompt entirely. If nothing remains after filtering, the tick is skipped.
+# 0 disables. Default 900 (15 min).
+tick_skip_if_idle_sec = 900
+# Tighter freshness gate: skip the tick if the *newest* message in the
+# buffer is older than this. Catches the "had a cluster of messages 12
+# minutes ago, then silence" case — conversation already wrapped up, the
+# bot's contribution would feel like talking to itself. Tune lower for a
+# quieter bot, higher for a more eager one. 0 disables. Default 300 (5 min).
+tick_skip_if_last_message_older_than_sec = 300
+
+[memory]
+extractor_batch_size = 20        # fire the memory extractor every N public messages per channel
+                                 # lower this (e.g. 5) for testing; raise for quieter channels
+
+[storage]
+db_path = "bot.sqlite"
+log_path = "bot.log"             # file gets DEBUG+; console gets INFO+ (or DEBUG with -v)
+
+[shutdown]
+# Default IRC QUIT line. Visible to all channels when the bot disconnects.
+# Operators can override per invocation with `!quit <custom message>`.
+quit_message = "shutting down"
+# Seconds to wait for in-flight reply turns to finish before forcing the
+# disconnect. 0 = rude (interrupts mid-turn). 30 = lets a typical LLM call
+# complete its summary if it's already past the tool-call phase.
+grace_sec = 30
+# Before disconnecting, post a short in-character farewell in each channel
+# that has had a message within the last N seconds. Costs one LLM call per
+# eligible channel (concurrent, capped by max_concurrent_chat_calls).
+# Default 900 mirrors the tick freshness window — channels that wouldn't
+# get an initiative tick don't get a goodbye. Set 0 to disable entirely
+# (channels still see the IRC QUIT message, just no extra farewell line).
+goodbye_recent_sec = 900
+# Wall-clock budget for ALL goodbye LLM calls combined. Channels that
+# don't complete within this window get skipped. Keeps shutdown from
+# hanging on a slow LLM.
+goodbye_timeout_sec = 30
+
+[ignore]
+nicks = ["Q", "ChanServ", "NickServ"]
+
+
+
+# Per-channel policy sections. Key is the literal channel name including #.
+# A channel listed here is automatically added to the join list (no need to
+# repeat it in [server].channels above).
+[channels."#myhouse"]
+mode = "chatty"                          # chatty | quiet | worker | locked
+persona = "a friendly and witty IRC chatbot, helpful and entertaining."
+task_issuers = "all"                     # all | ops | operator
+allow_actions = ["me", "topic", "msg"]   # opt-in IRC-native actions
+# Initiative tick: how often the bot considers whether to chime in unprompted
+# (chatty mode only; ignored in other modes). Each tick costs one short LLM
+# call (~500 prompt + ~10 completion tokens). 90s = ~960 ticks/day per channel.
+# Set to 0 to disable ticks for this channel even with chatty mode.
+tick_interval_sec = 90
+auto_summarise_links = true
+auto_welcome = true
+# Implicit recall: prepend top-K memory hits to every reply turn's system
+# context. Eliminates "the model forgot to call recall()" misses, at the
+# cost of one embedding call per turn. Default false; opt-in here.
+auto_recall = true
+auto_recall_k = 3
+
+[channels."##python"]
+mode = "quiet"
+persona = "a terse helper, only speaks when asked."
+task_issuers = "ops"
+allow_actions = []
+tick_interval_sec = 0
+auto_summarise_links = false
+auto_welcome = false
+
+

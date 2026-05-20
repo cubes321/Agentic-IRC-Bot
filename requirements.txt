@@ -1,0 +1,15 @@
+pydle>=1.0.1
+openai>=1.40
+httpx>=0.27
+aiosqlite>=0.20
+numpy>=1.26
+pydantic>=2.7
+beautifulsoup4>=4.12
+readability-lxml>=0.8.1
+yt-dlp>=2024.8.0
+Pint>=0.24
+# DuckDuckGo search lib. The package was renamed to `ddgs` in late 2024;
+# we prefer the new name and keep the old one available as a fallback.
+ddgs>=0.1.0; python_version >= "3.9"
+duckduckgo-search>=6.2; python_version >= "3.9"
+lxml>=5.2

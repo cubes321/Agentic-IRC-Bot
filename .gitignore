@@ -1,0 +1,61 @@
+# --- Runtime state (private, regenerated on use) ---
+# Bot database: contains every memory, message log row, token usage record,
+# and reminder. Per-channel data; never commit.
+bot.sqlite
+bot.sqlite-journal
+bot.sqlite-wal
+bot.sqlite-shm
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Debug log (DEBUG-level transcript; may include user message bodies).
+bot.log
+*.log
+
+# --- Secrets ---
+# Live config file (contains Brave API key, Q account name, path to Q
+# password file, etc.). Only `sample-config.toml` is committed as a template.
+config.toml
+# Q-bot password and any other plaintext credential files. The bot config
+# points to one of these by path — exclude by extension and common names.
+qpass.txt
+*.pass
+*password*
+*.key
+
+# --- Python build artifacts ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Virtualenvs / tooling ---
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# --- Editor / OS noise ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Throwaway scripts I sometimes write at the repo root for one-off ---
+# smoke tests and verification (e.g. _smoke.py, _check_gating.py).
+# Leading slash anchors this to the repo root — without it, this pattern
+# also matches bot/__init__.py because `_*` matches `__init__`.
+/_*.py

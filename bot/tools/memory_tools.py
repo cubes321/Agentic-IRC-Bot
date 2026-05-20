@@ -1,0 +1,287 @@
+"""Tier-4 tools: explicit memory + reminders.
+
+These are the LLM's interface to MemoryStore. The MemoryStore lives on the
+ToolContext as `ctx.memory`; if it's None (e.g. embed_model not configured)
+these tools degrade with a clear error.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timezone
+
+from . import Tool, ToolContext, register
+from ..db import now_utc_iso
+
+log = logging.getLogger(__name__)
+
+
+def _no_memory_error() -> dict:
+    return {
+        "error": "long-term memory is not configured (no embed_model in [ai] config)",
+    }
+
+
+# ---- recall ---------------------------------------------------------------
+
+async def _recall(ctx: ToolContext, args: dict) -> dict:
+    if ctx.memory is None:
+        return _no_memory_error()
+    query = (args.get("query") or "").strip()
+    if not query:
+        return {"error": "query is empty"}
+    k = int(args.get("k", 5))
+    k = max(1, min(k, 10))
+    hits = await ctx.memory.recall(ctx.channel, query, k=k)
+    return {
+        "channel": ctx.channel,
+        "query": query,
+        "results": [
+            {
+                "id": h.id,
+                "kind": h.kind,
+                "user_account": h.user_account,
+                "content": h.content,
+                "similarity": round(h.similarity, 3),
+                "created_at": h.created_at,
+            }
+            for h in hits
+        ],
+    }
+
+
+register(Tool(
+    name="recall",
+    description=(
+        "Search the bot's long-term memory of this channel for facts, "
+        "preferences, events, or topics relevant to a query. Use whenever "
+        "you might already know something about the user or the channel "
+        "you'd otherwise have to guess at."
+    ),
+    schema={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to look up. Free text."},
+            "k": {"type": "integer", "description": "Max results (1-10).", "default": 5},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+    requires={"memory"},
+    call=_recall,
+))
+
+
+# ---- remember -------------------------------------------------------------
+
+async def _remember(ctx: ToolContext, args: dict) -> dict:
+    if ctx.memory is None:
+        return _no_memory_error()
+    content = (args.get("content") or "").strip()
+    if not content:
+        return {"error": "content is empty"}
+    kind = args.get("kind", "fact")
+    if kind not in ("fact", "preference", "event", "topic"):
+        return {"error": f"invalid kind: {kind!r} (must be fact|preference|event|topic)"}
+    user_account = args.get("user_account") or None
+    new_id = await ctx.memory.add(
+        channel=ctx.channel,
+        kind=kind,
+        content=content,
+        user_account=user_account,
+        dedup=True,
+    )
+    if new_id is None:
+        return {"stored": False, "reason": "duplicate or near-duplicate of existing memory"}
+    return {"stored": True, "id": new_id}
+
+
+register(Tool(
+    name="remember",
+    description=(
+        "Save a durable fact about this channel or one of its users to "
+        "long-term memory. The bot also extracts facts automatically every "
+        "20 messages, but call this when something is worth pinning down "
+        "right now."
+    ),
+    schema={
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "Short, declarative sentence stating the fact.",
+            },
+            "kind": {
+                "type": "string",
+                "enum": ["fact", "preference", "event", "topic"],
+                "default": "fact",
+            },
+            "user_account": {
+                "type": ["string", "null"],
+                "description": "Account name the fact is about, or null for channel-wide.",
+            },
+        },
+        "required": ["content"],
+        "additionalProperties": False,
+    },
+    requires={"memory"},
+    call=_remember,
+))
+
+
+# ---- forget ---------------------------------------------------------------
+
+async def _forget(ctx: ToolContext, args: dict) -> dict:
+    if ctx.memory is None:
+        return _no_memory_error()
+    try:
+        memory_id = int(args["memory_id"])
+    except (TypeError, ValueError):
+        return {"error": "memory_id must be an integer"}
+
+    # Look up the memory FIRST so we can report its content back to the LLM.
+    # If the LLM mistakenly picks the wrong id, the human will see exactly
+    # what was deleted in the bot's reply ("I removed: 'X'") and can correct.
+    row = await ctx.db.fetchone(
+        "SELECT id, kind, user_account, content, channel FROM memories WHERE id = ?",
+        (memory_id,),
+    )
+    if row is None:
+        return {"forgotten": False, "id": memory_id, "error": "no memory with that id"}
+    if row["channel"] != ctx.channel:
+        # Refuse cross-channel deletes: each channel's memory is its own scope.
+        return {
+            "forgotten": False,
+            "id": memory_id,
+            "error": (
+                f"that memory belongs to {row['channel']}, not this channel "
+                f"({ctx.channel}). Run recall() in {row['channel']} to manage it."
+            ),
+        }
+
+    ok = await ctx.memory.forget(memory_id)
+    return {
+        "forgotten": ok,
+        "id": memory_id,
+        "kind": row["kind"],
+        "user_account": row["user_account"],
+        "content": row["content"],  # echo so the LLM can confirm in its reply
+    }
+
+
+register(Tool(
+    name="forget",
+    description=(
+        "Delete a single memory by id. CRITICAL: ALWAYS call recall() first, "
+        "review its results, and pick the id whose 'content' matches what the "
+        "user wants forgotten. Do not guess at ids. After a successful forget(), "
+        "tell the user exactly what was deleted by quoting the returned 'content' "
+        "field verbatim, so they can correct you if it was wrong. Refuses to "
+        "delete memories that belong to a different channel."
+    ),
+    schema={
+        "type": "object",
+        "properties": {
+            "memory_id": {
+                "type": "integer",
+                "description": "ID from a recent recall() result. Do not guess.",
+            },
+        },
+        "required": ["memory_id"],
+        "additionalProperties": False,
+    },
+    requires={"memory"},
+    call=_forget,
+))
+
+
+# ---- set_reminder ---------------------------------------------------------
+
+def _parse_when(spec: str) -> datetime | None:
+    """Accept either an ISO-8601 timestamp or a relative offset like
+    '5m', '2h', '1d', '1h30m'. Returns aware UTC datetime."""
+    spec = spec.strip()
+    if not spec:
+        return None
+    # Try ISO first.
+    try:
+        dt = datetime.fromisoformat(spec.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        pass
+    # Relative: number+unit pairs, e.g. "1h30m".
+    import re as _re
+    total_sec = 0
+    matches = _re.findall(r"(\d+)\s*([smhdw])", spec.lower())
+    if not matches:
+        return None
+    unit_to_sec = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    for n, unit in matches:
+        total_sec += int(n) * unit_to_sec[unit]
+    if total_sec <= 0:
+        return None
+    return datetime.now(timezone.utc).replace(microsecond=0) + _td(total_sec)
+
+
+def _td(seconds: int):
+    from datetime import timedelta
+    return timedelta(seconds=seconds)
+
+
+async def _set_reminder(ctx: ToolContext, args: dict) -> dict:
+    when = _parse_when(args.get("when", ""))
+    if when is None:
+        return {"error": "could not parse 'when' (try ISO timestamp or e.g. '15m', '2h', '1d')"}
+    target_nick = args.get("target_nick") or ctx.actor_nick
+    message = (args.get("message") or "").strip()
+    if not message:
+        return {"error": "message is empty"}
+    payload = json.dumps({"target_nick": target_nick, "message": message})
+    new_id = await ctx.db.insert_returning_id(
+        "INSERT INTO reminders (channel, fire_at, payload) VALUES (?, ?, ?)",
+        (ctx.channel, when.isoformat(), payload),
+    )
+    return {
+        "scheduled": True,
+        "id": new_id,
+        "fire_at": when.isoformat(),
+        "target_nick": target_nick,
+    }
+
+
+register(Tool(
+    name="set_reminder",
+    description=(
+        "Schedule a reminder to be posted to this channel at a future time. "
+        "When fires, the bot will message the channel mentioning the target "
+        "user. NOTE: actual delivery requires the scheduler (slice 2b); "
+        "this call persists the reminder regardless."
+    ),
+    schema={
+        "type": "object",
+        "properties": {
+            "when": {
+                "type": "string",
+                "description": (
+                    "Either an ISO-8601 UTC timestamp ('2026-04-29T12:00:00Z') or "
+                    "a relative offset ('15m', '2h', '1h30m', '1d', '1w')."
+                ),
+            },
+            "target_nick": {
+                "type": ["string", "null"],
+                "description": "Nick to mention in the reminder. Defaults to the user who asked.",
+            },
+            "message": {
+                "type": "string",
+                "description": "Text of the reminder.",
+            },
+        },
+        "required": ["when", "message"],
+        "additionalProperties": False,
+    },
+    requires={"memory"},
+    call=_set_reminder,
+))
