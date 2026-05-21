@@ -9,6 +9,15 @@ breaking changes freely until a `1.0.0` release).
 
 ## [Unreleased]
 
+### Fixed
+- Command dispatch now strips a leading bot-nick mention before matching.
+  Previously `!task X` worked but `CubesBot: !task X` (or any other
+  nick-prefixed form, which is the natural IRC habit) fell through to
+  the engagement path and got treated as a regular question instead of
+  a command. Affects all five commands (`!task`, `!cancel`, `!tasks`,
+  `!memory_stats`, `!quit`). Bare forms (`!task` alone) now also
+  dispatch and trigger a usage message rather than falling through.
+
 ### Added (Slice 2c — Tasks)
 - **Multi-step background tasks.** Users can now issue long-running goals
   to the bot via three chat commands:

@@ -239,12 +239,21 @@ class IRCBot(pydle.Client):
             if self.memory_writer is not None:
                 self.memory_writer.note_message(target)
 
+        # For command dispatch, strip a leading bot-nick mention so commands
+        # work whether typed bare ("!task X") or addressed to the bot
+        # ("CubesBot: !task X", "CubesBot !task X", "CubesBot, !task X").
+        # Without this, only the bare form matches — real users almost always
+        # prefix commands with the bot's nick when addressing it.
+        # Engagement detection further down still uses the ORIGINAL message
+        # so mentions are correctly detected for non-command messages.
+        stripped = message.strip()
+        cmd_text = self._mention_re.sub("", stripped, count=1).strip(" :,") or stripped
+
         # Operator-only !quit command. Handled BEFORE the shutdown gate
         # (otherwise a stuck shutdown couldn't be re-triggered) but only by
         # operators (so a random user can't kill the bot).
-        stripped = message.strip()
-        if stripped == "!quit" or stripped.startswith("!quit "):
-            parting = stripped[5:].strip() or None
+        if cmd_text == "!quit" or cmd_text.startswith("!quit "):
+            parting = cmd_text[5:].strip() or None
             asyncio.create_task(
                 self._cmd_quit(reply_target, source, parting)
             )
@@ -260,21 +269,24 @@ class IRCBot(pydle.Client):
 
         # Chat-style commands (handled BEFORE engagement so they don't burn a
         # mention or an LLM call). Public-channel only; DMs go to agent.
-        if not is_dm and message.strip() == "!memory_stats":
+        if not is_dm and cmd_text == "!memory_stats":
             asyncio.create_task(self._cmd_memory_stats(target))
             return
 
         # Slice 2c: task commands. Channel-only; auth gated inside the handler.
         # All three are early-dispatched so they don't burn a reply turn or
         # require a mention — they're plain commands, not bot addressing.
-        if not is_dm and (stripped == "!tasks" or stripped.startswith("!tasks ")):
+        # Each command form accepts both "!cmd" (bare, prompts usage if args
+        # are required) and "!cmd <args>" — that way "CubesBot !task" alone
+        # gets a usage hint instead of falling through to engagement.
+        if not is_dm and (cmd_text == "!tasks" or cmd_text.startswith("!tasks ")):
             asyncio.create_task(self._cmd_list_tasks(target))
             return
-        if not is_dm and stripped.startswith("!cancel "):
-            asyncio.create_task(self._cmd_cancel_task(target, source, stripped))
+        if not is_dm and (cmd_text == "!cancel" or cmd_text.startswith("!cancel ")):
+            asyncio.create_task(self._cmd_cancel_task(target, source, cmd_text))
             return
-        if not is_dm and stripped.startswith("!task "):
-            asyncio.create_task(self._cmd_issue_task(target, source, stripped))
+        if not is_dm and (cmd_text == "!task" or cmd_text.startswith("!task ")):
+            asyncio.create_task(self._cmd_issue_task(target, source, cmd_text))
             return
 
         # Engagement: DMs always engage; channel messages need a mention.
