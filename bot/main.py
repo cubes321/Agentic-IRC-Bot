@@ -27,7 +27,7 @@ if sys.version_info < (3, 11):
     sys.exit(1)
 
 import httpx
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, APIConnectionError, APIError
 
 from datetime import datetime, timezone
 
@@ -117,6 +117,66 @@ async def _print_usage_summary(db: Database, session_started_iso: str) -> None:
         log.info(line)
 
 
+async def _check_llm_endpoint(
+    client: AsyncOpenAI,
+    base_url: str,
+    label: str = "chat",
+) -> None:
+    """Probe the OpenAI-compatible endpoint at startup. Logs success with the
+    list of loaded models, or a clear WARNING if unreachable. Never raises —
+    a failed health check is informational only. The bot can still connect
+    to IRC; LLM calls start working as soon as the endpoint comes up.
+
+    Uses a tight 5s timeout: at startup, waiting 90s for an unreachable
+    LM Studio is the wrong UX. Per-call timeouts (cfg.budgets.llm_call_timeout_sec)
+    handle the slow-but-alive case at request time."""
+    log = logging.getLogger("bot.main")
+    try:
+        models_page = await asyncio.wait_for(client.models.list(), timeout=5.0)
+        names = sorted(m.id for m in models_page.data)
+        if names:
+            # Compact listing — long model names + many models would push
+            # the line past readable width. Show count + first few.
+            preview = ", ".join(names[:5])
+            more = f" (+{len(names) - 5} more)" if len(names) > 5 else ""
+            log.info(
+                "LM Studio (%s endpoint) reachable at %s; %d model(s) loaded: %s%s",
+                label, base_url, len(names), preview, more,
+            )
+        else:
+            log.warning(
+                "LM Studio (%s endpoint) reachable at %s but NO models are loaded. "
+                "Load your chat model in LM Studio before the bot is engaged.",
+                label, base_url,
+            )
+    except asyncio.TimeoutError:
+        log.warning(
+            "LM Studio (%s endpoint) did not respond within 5s at %s. "
+            "Is LM Studio running? Reply turns will fail until it's up.",
+            label, base_url,
+        )
+    except APIConnectionError as e:
+        log.warning(
+            "LM Studio (%s endpoint) appears unreachable at %s: %s. "
+            "Is LM Studio running? Reply turns will fail until it's up.",
+            label, base_url, e,
+        )
+    except APIError as e:
+        # Endpoint responded but with an API-shaped error (auth, bad path,
+        # wrong API version). Worth surfacing distinctly from a connection
+        # error so the user knows it's NOT a "is LM Studio running" issue.
+        log.warning(
+            "LM Studio (%s endpoint) at %s returned an API error: %s. "
+            "Check base_url and api_key in config.",
+            label, base_url, e,
+        )
+    except Exception as e:
+        log.warning(
+            "LM Studio (%s endpoint) health check at %s failed: %s. Continuing anyway.",
+            label, base_url, e,
+        )
+
+
 def _build_capabilities(cfg: Config) -> set[str]:
     caps: set[str] = set()
     if cfg.ai.vision_model:
@@ -153,6 +213,19 @@ async def run(cfg: Config, shutdown_event: asyncio.Event) -> None:
         if cfg.ai.vision_base_url and cfg.ai.vision_base_url != cfg.ai.base_url
         else chat_client
     )
+
+    # Startup health check: ping the LM Studio endpoint(s) once so the
+    # operator sees a clear warning at boot if the API is unreachable
+    # (e.g. forgot to start LM Studio first). Non-blocking: a failed check
+    # warns and continues — IRC still connects, LLM calls will start
+    # working as soon as the endpoint comes up. We probe vision separately
+    # only when it's on a different endpoint than chat; sharing one client
+    # means one check covers both.
+    await _check_llm_endpoint(chat_client, cfg.ai.base_url, label="chat")
+    if vision_client is not chat_client:
+        await _check_llm_endpoint(
+            vision_client, cfg.ai.effective_vision_base_url, label="vision"
+        )
 
     # Concurrency cap on outbound chat completions, shared by AgentCore,
     # MemoryStore (extractor), and Scheduler (initiative ticks). Embeddings

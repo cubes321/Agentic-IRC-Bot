@@ -9,10 +9,26 @@ breaking changes freely until a `1.0.0` release).
 
 ## [Unreleased]
 
+### Added
+- Startup health check that probes the configured LM Studio endpoint(s)
+  once at boot. On success, logs the count of loaded models plus the
+  first few names — instant visibility into whether the configured
+  `chat_model` / `embed_model` / `vision_model` are actually present
+  under those names. On failure (timeout, connection error, API error),
+  logs a clear WARNING naming the likely cause. Non-blocking — bot still
+  starts and connects to IRC even if LM Studio is down. Probes vision
+  endpoint separately only when it's at a different `base_url` than chat.
+
 ### Changed
 - `start.bat` now invokes the venv's `python.exe` directly rather than
   whatever `python` is on the system PATH. Bot runs in its own isolated
   dependency set regardless of shell activation state.
+- Goodbye broadcast: tightened `GOODBYE_SYSTEM` prompt to default to
+  speaking. Silence is now reserved for the rare "no real-user activity
+  in the buffer" case rather than the broad "feels weird to interrupt"
+  escape that local Qwen 3-class models were taking ~100% of the time.
+- Goodbye broadcast: silence outcome bumped from DEBUG to INFO so the
+  per-channel result is visible at default log level.
 
 ### Docs
 - README setup section: explicit venv creation step (Windows + Unix
