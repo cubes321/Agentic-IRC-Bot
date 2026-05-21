@@ -10,6 +10,17 @@ breaking changes freely until a `1.0.0` release).
 ## [Unreleased]
 
 ### Fixed
+- Text-format tool-call leakage: when a local model emits a tool call as
+  plain text (Hermes `<tool_call>` XML, Mistral `[TOOL_CALLS]`, Qwen
+  flower markers, etc.) instead of via the structured `tool_calls` API,
+  the agent loop now detects this, injects a repair message asking the
+  model to use the proper mechanism, and continues. The text-format
+  garbage is no longer returned to the channel. As a safety net, the
+  budget-exhausted summary path also strips any text-tool-call blocks
+  before returning (single regex pass; doesn't fire in normal use). Was
+  causing tasks to post `<tool_call><function=...>...` as their final
+  result on certain Qwen-class models when LM Studio's compat adapter
+  failed to convert the model's native format to the OpenAI shape.
 - Command dispatch now strips a leading bot-nick mention before matching.
   Previously `!task X` worked but `CubesBot: !task X` (or any other
   nick-prefixed form, which is the natural IRC habit) fell through to

@@ -138,6 +138,17 @@ LOOP_DETECTOR_NUDGE = (
     "different arguments, or finish your turn."
 )
 
+REPAIR_TEXT_TOOL_CALL = (
+    "Your previous response contained what looks like a tool call written as "
+    "plain text (using <tool_call> tags, <function=...> tags, or a similar "
+    "format). Those tags only display as text in the chat channel; they do "
+    "NOT actually invoke any tool. To really call a tool, use the structured "
+    "tool-calling mechanism exposed by the chat completion API — the same "
+    "mechanism you've been using successfully on earlier steps. Try the call "
+    "again using that mechanism. If you don't need a tool call after all, "
+    "answer in plain text without any tool-call tags."
+)
+
 BUDGET_EXHAUSTED_SUMMARY = (
     "You ran out of tool-call budget before finishing. "
     "Write a short, honest reply to the user explaining what you found so far "

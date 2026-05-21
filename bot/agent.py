@@ -62,6 +62,52 @@ def _strip_thinking(text: str) -> tuple[str, int]:
     return cleaned.strip(), original_len - len(cleaned.strip())
 
 
+# Text-format tool call detection. Some local models emit tool calls as
+# plain text using their training-time format (Hermes XML, Mistral
+# brackets, Qwen flower markers) instead of via the structured tool_calls
+# API. LM Studio's compat adapter doesn't always convert these to the
+# expected shape, so they leak through as plain content. We detect them
+# and treat as a repair-worthy mistake.
+_TEXT_TOOL_CALL_MARKERS = (
+    "<tool_call>",        # Hermes / Llama 3.1 / many Qwen variants
+    "<function=",         # Hermes function tag, sometimes without <tool_call> wrapper
+    "[tool_calls]",       # Mistral
+    "✿function✿",         # Qwen2.5 instruct variants
+    "✿args✿",
+)
+
+
+def _looks_like_text_tool_call(text: str) -> bool:
+    """True if the model's text content appears to contain a tool call
+    written as plain text instead of via the structured tool_calls API.
+    Conservative: only matches well-known format markers, not casual
+    mentions of the word 'tool_call' in prose."""
+    if not text:
+        return False
+    lower = text.lower()
+    return any(marker in lower for marker in _TEXT_TOOL_CALL_MARKERS)
+
+
+# Regex used as a safety net to strip text-format tool calls from the
+# FINAL returned text in paths where retry isn't possible (e.g. the
+# budget-exhausted summary). Replaces the block with a brief marker so
+# the user sees a hint that something was suppressed rather than just
+# missing context.
+_STRIP_TOOL_CALL_RE = _re.compile(
+    r"<tool_call>.*?</tool_call>",
+    flags=_re.IGNORECASE | _re.DOTALL,
+)
+
+
+def _strip_text_tool_calls(text: str) -> str:
+    """Remove obvious text-format tool call blocks. Safety net only —
+    the preferred fix is repair-and-retry inside _run_loop."""
+    if not text:
+        return text
+    cleaned = _STRIP_TOOL_CALL_RE.sub("[malformed tool call removed]", text)
+    return cleaned.strip()
+
+
 def _format_recent(rows: list) -> str:
     if not rows:
         return "(no recent messages)"
@@ -356,6 +402,31 @@ class AgentCore:
                         "agent: stripped %d chars of <think> reasoning from final reply",
                         removed,
                     )
+                # Text-format tool call detection: some local models emit
+                # tool calls as plain text (Hermes XML / Mistral brackets /
+                # Qwen flowers) instead of via the structured tool_calls
+                # API. Don't return that to the channel as final content —
+                # nudge the model to retry using the actual mechanism.
+                # Re-checking inside the loop means we get to use the next
+                # step to recover; the safety-net strip below catches the
+                # case where we ran out of steps.
+                if _looks_like_text_tool_call(cleaned):
+                    log.warning(
+                        "agent: step %d emitted a text-format tool call instead "
+                        "of using the tools API; injecting repair and continuing",
+                        step + 1,
+                    )
+                    # Echo the assistant message into history so the next
+                    # turn has full context of what it just did wrong.
+                    messages.append({
+                        "role": "assistant",
+                        "content": msg.content or "",
+                    })
+                    messages.append({
+                        "role": "system",
+                        "content": prompts.REPAIR_TEXT_TOOL_CALL,
+                    })
+                    continue
                 return cleaned or None
 
             # Echo the assistant message back into history before tool results.
@@ -437,4 +508,14 @@ class AgentCore:
         cleaned, removed = _strip_thinking(resp.choices[0].message.content or "")
         if removed:
             log.debug("agent: stripped %d chars of <think> reasoning from summary", removed)
+        # Safety net: the budget-exhausted summary can't be retried, so
+        # strip any text-format tool calls in place rather than posting them.
+        # This rarely fires in practice (most models stop trying to call
+        # tools when told "no more tools"), but the cost is one regex pass.
+        if _looks_like_text_tool_call(cleaned):
+            log.warning(
+                "agent: budget-exhausted summary contained a text-format tool "
+                "call; stripping (no remaining steps to repair)"
+            )
+            cleaned = _strip_text_tool_calls(cleaned)
         return cleaned or None
