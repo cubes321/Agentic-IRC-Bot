@@ -68,6 +68,18 @@ with first-class support for **Quakenet** authentication.
 - Reminder loop polls the table every 10s (configurable), posts due
   reminders to the channel.
 
+**Background tasks** (`bot/tasks.py`)
+- `!task <goal>` schedules a multi-step background task. 30-step /
+  30-minute budgets; uses the full tool catalog; cancellable via
+  `!cancel <id>`; listable via `!tasks`.
+- Auth gated per-channel by `task_issuers` (`all | ops | operator`).
+- Persisted to the `tasks` table (status lifecycle: pending → running →
+  done / failed / cancelled). Restart-safe: any task left in `running`
+  from a previous bot lifetime gets marked `cancelled` with
+  `[interrupted by restart]` on next boot.
+- Shutdown cancels any running tasks with a brief channel notice before
+  the bot disconnects.
+
 **Graceful shutdown** (`bot/main.py`, `bot/ircclient.py`)
 - Operator-only `!quit [parting message]` IRC command.
 - SIGINT/SIGTERM (Unix) and KeyboardInterrupt (Windows) route through the
@@ -179,10 +191,22 @@ and the token-usage summary on exit.
 - **Mention or DM** the bot to engage normally.
 - **`!memory_stats`** in any channel: prints per-channel memory totals,
   kinds breakdown, top users.
+- **`!task <goal>`**: schedule a multi-step background task. The bot will
+  work on it using its full tool catalog and a 30-step / 30-minute budget,
+  then post the result back to the channel with a `[task #N]` prefix.
+  Authorised per `[channels."#name"].task_issuers` (`all | ops | operator`).
+  Example: `!task search for recent reviews of the Framework Laptop 13 and summarise the consensus`.
+- **`!cancel <id>`**: cancel a running task. Allowed for the task's
+  original issuer (by account) or any operator. The agent finishes its
+  current step before the cancellation lands, so allow up to ~one LLM
+  call duration for the `[task #N] cancelled` line to appear.
+- **`!tasks`**: list recent tasks in the current channel (any status,
+  most recent first) with id, state, age, owner, and goal preview.
 - **`!quit [parting message]`** (operator only): graceful shutdown.
   Operator status is bot-wide (account in `[operator].accounts`); channel
   ops are NOT sufficient. Sends an in-character goodbye in each active
-  channel before disconnecting.
+  channel before disconnecting. Any running tasks get cancelled with a
+  brief interruption notice posted to their channels.
 - **Ctrl+C / SIGINT / SIGTERM**: same graceful path, no parting message.
 
 ## Quick smoke test
@@ -235,6 +259,7 @@ bot/main.py           # entry point: builds deps, wires shutdown event
 bot/ircclient.py      # pydle subclass; routes events, on_ctcp_action for /me
 bot/agent.py          # LLM tool-call loop with all defensive features
 bot/scheduler.py      # initiative ticks, reminder firing, shutdown goodbyes
+bot/tasks.py          # TaskRunner: !task / !cancel / !tasks lifecycle
 bot/memory.py         # MemoryStore (embed + recall) + MemoryWriter (extractor)
 bot/auth.py           # Quakenet account-based authorisation + op tracking
 bot/policy.py         # per-channel ChannelPolicy wrapper

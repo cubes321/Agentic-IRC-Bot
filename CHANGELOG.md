@@ -9,6 +9,39 @@ breaking changes freely until a `1.0.0` release).
 
 ## [Unreleased]
 
+### Added (Slice 2c — Tasks)
+- **Multi-step background tasks.** Users can now issue long-running goals
+  to the bot via three chat commands:
+  - `!task <goal>` — schedule a background task. Auth gated by the
+    channel's `task_issuers` policy (`all | ops | operator`). Returns
+    immediately with `[task #N] starting: <goal>`; the bot works on it
+    in the background.
+  - `!cancel <id>` — cancel a running task. Authorised for the task's
+    issuer (by account) or any operator. Task posts a cancellation line
+    when the agent loop reaches the next step boundary.
+  - `!tasks` — list recent tasks for the channel (any status) with id,
+    state, age, owner, goal preview.
+- `TaskRunner` (new `bot/tasks.py`): owns the task lifecycle. Persists
+  every task to the `tasks` table immediately on issuance, transitions
+  pending → running → done/failed/cancelled, and posts results back to
+  the channel with `[task #N] ...` prefix.
+- `AgentCore.run_task_turn()`: new entry point for task-mode agent calls.
+  Uses `TASK_SYSTEM` prompt, 30-step / 30-minute budgets (per
+  `[budgets].task_step_cap` and `task_wall_sec`), and supports
+  cancellation via an `asyncio.Event` checked at every step boundary.
+- `_run_loop` cancel-event support: the shared agent loop now honours a
+  cancel_event for any caller that wants cooperative interruption.
+  Reply turns still don't pass one (no use case); tasks always do.
+- Restart safety: on startup, `TaskRunner.startup_cleanup()` marks any
+  tasks left in `running` state from a previous bot lifetime as
+  `cancelled` with result `"[interrupted by restart]"`. Resuming a
+  partial agent loop is unsafe with local models (no determinism, tools
+  may have side effects), so the policy is "fail safe, let user re-issue."
+- Shutdown safety: `TaskRunner.shutdown_all()` cancels every running task
+  during graceful shutdown, with a 10-second grace period for agent
+  loops to wind down cleanly before hard-cancelling. Each task posts a
+  brief interruption line to its channel before the bot disconnects.
+
 ### Added
 - Startup health check that probes the configured LM Studio endpoint(s)
   once at boot. On success, logs the count of loaded models plus the

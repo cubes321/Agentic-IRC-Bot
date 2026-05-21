@@ -51,6 +51,7 @@ class IRCBot(pydle.Client):
         q_password: str | None,
         memory_writer: MemoryWriter | None = None,
         shutdown_event: asyncio.Event | None = None,
+        task_runner: Any = None,           # bot.tasks.TaskRunner (untyped to avoid cycle)
         **kwargs: Any,
     ):
         super().__init__(nickname=nickname, realname=realname, **kwargs)
@@ -61,6 +62,11 @@ class IRCBot(pydle.Client):
         self.http = http
         self.q_password = q_password
         self.memory_writer = memory_writer
+        # TaskRunner is wired in main.py after bot construction (chicken-and-egg:
+        # TaskRunner needs `bot` to post results; bot needs `task_runner` to
+        # dispatch !task commands). Set via `bot.task_runner = ...` post-init.
+        # None until then; command handlers gracefully refuse if so.
+        self.task_runner = task_runner
         # Shared shutdown signal: set by !quit, signal handlers, or main loop
         # exit. Checked by on_message to refuse new engagements once set. Main
         # waits on this event to know when to begin tear-down.
@@ -256,6 +262,19 @@ class IRCBot(pydle.Client):
         # mention or an LLM call). Public-channel only; DMs go to agent.
         if not is_dm and message.strip() == "!memory_stats":
             asyncio.create_task(self._cmd_memory_stats(target))
+            return
+
+        # Slice 2c: task commands. Channel-only; auth gated inside the handler.
+        # All three are early-dispatched so they don't burn a reply turn or
+        # require a mention — they're plain commands, not bot addressing.
+        if not is_dm and (stripped == "!tasks" or stripped.startswith("!tasks ")):
+            asyncio.create_task(self._cmd_list_tasks(target))
+            return
+        if not is_dm and stripped.startswith("!cancel "):
+            asyncio.create_task(self._cmd_cancel_task(target, source, stripped))
+            return
+        if not is_dm and stripped.startswith("!task "):
+            asyncio.create_task(self._cmd_issue_task(target, source, stripped))
             return
 
         # Engagement: DMs always engage; channel messages need a mention.
@@ -456,6 +475,115 @@ class IRCBot(pydle.Client):
     def quit_message(self) -> str:
         """The QUIT line to use on disconnect. !quit override beats config default."""
         return self._quit_message or self.cfg.shutdown.quit_message
+
+    # ---- task commands (slice 2c) ----
+
+    async def _cmd_issue_task(self, channel: str, source: str, stripped: str) -> None:
+        """`!task <goal>` — schedule a multi-step background task.
+
+        Auth gate: ChannelPolicy.can_issue_tasks(actor). The actor's account
+        is the source of truth (nicks can change); if the account isn't
+        cached yet, we WHOIS first so the policy check sees real identity.
+        """
+        if self.task_runner is None:
+            await self.irc_send(channel, "(tasks not available — TaskRunner not wired)")
+            return
+
+        goal = stripped[len("!task "):].strip()
+        if not goal:
+            await self.irc_send(channel, "Usage: !task <goal>  (e.g. '!task summarise https://example.com')")
+            return
+        if len(goal) > 500:
+            await self.irc_send(channel, "(goal too long; max 500 chars)")
+            return
+
+        # Resolve identity for auth. ChannelPolicy.can_issue_tasks reads
+        # actor.is_operator (account-based) and actor.is_op_in_channel (live
+        # +o on this channel). We need both to be accurate, so WHOIS first
+        # if the account isn't cached.
+        await self._ensure_account_known(source)
+        actor = self.auth.actor_for(source, channel)
+
+        policy = self._policy_for(channel)
+        if not policy.can_issue_tasks(actor):
+            issuers = policy.cfg.task_issuers
+            log.info(
+                "!task refused: %s (account=%r, op=%s) lacks task_issuers='%s' in %s",
+                source, actor.account, actor.is_op_in_channel, issuers, channel,
+            )
+            await self.irc_send(
+                channel,
+                f"(refusing !task: this channel restricts tasks to '{issuers}')",
+            )
+            return
+
+        try:
+            task_id = await self.task_runner.issue_task(
+                channel=channel,
+                owner_nick=source,
+                owner_account=actor.account,
+                goal=goal,
+            )
+        except Exception as e:
+            log.exception("issue_task failed in %s", channel)
+            await self.irc_send(channel, f"(failed to schedule task: {e})")
+            return
+
+        await self.irc_send(channel, f"[task #{task_id}] starting: {goal}")
+
+    async def _cmd_cancel_task(self, channel: str, source: str, stripped: str) -> None:
+        """`!cancel <id>` — cancel a running task. Auth = issuer or operator."""
+        if self.task_runner is None:
+            await self.irc_send(channel, "(tasks not available — TaskRunner not wired)")
+            return
+
+        rest = stripped[len("!cancel "):].strip()
+        try:
+            task_id = int(rest)
+        except ValueError:
+            await self.irc_send(channel, "Usage: !cancel <id>  (id is the number from '[task #N]')")
+            return
+
+        await self._ensure_account_known(source)
+        account = self._cached_account_or_none(source)
+        is_operator = self.auth.is_operator(account)
+
+        msg = await self.task_runner.cancel_task(
+            task_id=task_id,
+            cancelled_by_nick=source,
+            cancelled_by_account=account,
+            is_operator=is_operator,
+        )
+        await self.irc_send(channel, msg)
+
+    async def _cmd_list_tasks(self, channel: str) -> None:
+        """`!tasks` — list recent tasks for this channel. Read-only, no auth."""
+        if self.task_runner is None:
+            await self.irc_send(channel, "(tasks not available — TaskRunner not wired)")
+            return
+
+        try:
+            rows = await self.task_runner.list_tasks(channel)
+        except Exception:
+            log.exception("list_tasks failed for %s", channel)
+            await self.irc_send(channel, "(failed to list tasks; see logs)")
+            return
+
+        if not rows:
+            await self.irc_send(channel, f"No tasks in {channel} yet.")
+            return
+
+        # One-line-per-task render. Truncate goals so the line fits IRC width.
+        for r in rows:
+            goal_preview = (r["goal"] or "")[:60]
+            if len(r["goal"] or "") > 60:
+                goal_preview += "…"
+            # created_at is ISO; trim to HH:MM:SS for readability in the channel.
+            ts = (r["created_at"] or "")[11:19] or "?"
+            await self.irc_send(
+                channel,
+                f"  #{r['id']} [{r['status']}] {ts} {r['owner_nick']}: {goal_preview}",
+            )
 
     async def _cmd_memory_stats(self, channel: str) -> None:
         """Post a quick diagnostic about this channel's memory store. Reads

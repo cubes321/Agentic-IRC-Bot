@@ -220,6 +220,79 @@ class AgentCore:
             purpose="reply",
         )
 
+    async def run_task_turn(
+        self,
+        bot: Any,
+        channel: str,
+        policy: ChannelPolicy,
+        owner_nick: str,
+        owner_account: str | None,
+        goal: str,
+        http: Any,
+        cancel_event: asyncio.Event,
+    ) -> str | None:
+        """Run the agent loop in task mode: 30-step / 30-min budgets (per
+        policy), TASK_SYSTEM prompt, no recent-buffer context (the goal is
+        the context), cancellation support via cancel_event.
+
+        Returns the final text to post as the task result. May return the
+        sentinel string "__CANCELLED__" if the cancel_event fired mid-run;
+        callers (TaskRunner) detect this and write an appropriate
+        cancellation message instead of posting the sentinel verbatim."""
+        step_cap = policy.step_cap_for("task")
+        wall_sec = policy.wall_cap_for("task")
+
+        tools = build_catalog(self.capabilities, set(policy.cfg.allow_actions))
+        tools_schema = to_openai_schema(tools) if tools else None
+
+        # Task prompt carries the goal AND the budget — the model can plan
+        # accordingly ("I have 30 steps; I should pick efficient tools").
+        # No recent buffer: task context is the goal itself; channel chatter
+        # would be distracting noise relative to the task at hand.
+        messages: list[dict] = [
+            {
+                "role": "system",
+                "content": prompts.TASK_SYSTEM.format(
+                    persona=policy.persona,
+                    channel=channel,
+                    owner_nick=owner_nick,
+                    goal=goal,
+                    step_cap=step_cap,
+                    wall_sec=wall_sec,
+                ),
+            },
+            # A synthetic "user message" tells the model what to do right now,
+            # matching the user/assistant alternation Qwen 3-class chat templates
+            # require. Without it, some templates refuse to render with system-only.
+            {
+                "role": "user",
+                "content": f"Begin the task. Use the tools available; stop when done or stuck.",
+            },
+        ]
+
+        ctx = ToolContext(
+            bot=bot,
+            channel=channel,
+            actor_nick=owner_nick,
+            actor_account=owner_account,
+            cfg=self.cfg,
+            db=self.db,
+            http=http,
+            llm_chat=self.chat,
+            llm_vision=self.vision,
+            memory=self.memory,
+        )
+        return await self._run_loop(
+            messages=messages,
+            tools=tools,
+            tools_schema=tools_schema,
+            ctx=ctx,
+            step_cap=step_cap,
+            wall_sec=wall_sec,
+            purpose="task",
+            cancel_event=cancel_event,
+        )
+
     async def _run_loop(
         self,
         messages: list[dict],
@@ -229,7 +302,15 @@ class AgentCore:
         step_cap: int,
         wall_sec: int,
         purpose: str = "reply",
+        cancel_event: asyncio.Event | None = None,
     ) -> str | None:
+        """The agent loop. Honoured by all turn types (reply, task, future).
+
+        cancel_event (new in slice 2c, optional): checked between steps. When
+        set, the loop returns a cancellation marker rather than continuing.
+        Tasks use this to support !cancel mid-run; reply turns don't set it
+        because reply turns are short enough that cancellation has no use case.
+        """
         deadline = time.monotonic() + wall_sec
         tools_by_name = {t.name: t for t in tools}
         last_sig: tuple[str, str] | None = None
@@ -241,6 +322,13 @@ class AgentCore:
         # to "remaining budget" caused spurious ReadTimeouts.
         call_timeout = float(self.cfg.budgets.llm_call_timeout_sec)
         for step in range(step_cap):
+            # Cancellation gate: checked at the TOP of every step so we never
+            # start a new LLM call after a !cancel has been issued. The marker
+            # is sentinel text the runner unpacks; cancel handling is the
+            # runner's job, not the loop's.
+            if cancel_event is not None and cancel_event.is_set():
+                log.info("agent: cancel_event observed at step %d, exiting loop", step)
+                return "__CANCELLED__"
             if time.monotonic() > deadline:
                 log.info("agent: wall-clock deadline reached at step %d", step)
                 break

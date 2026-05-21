@@ -38,6 +38,7 @@ from .db import Database
 from .ircclient import IRCBot
 from .memory import MemoryStore, MemoryWriter
 from .scheduler import Scheduler
+from .tasks import TaskRunner
 # Importing tools triggers self-registration into the registry.
 from . import tools  # noqa: F401
 
@@ -300,6 +301,27 @@ async def run(cfg: Config, shutdown_event: asyncio.Event) -> None:
         ircbot=client,
     )
 
+    # TaskRunner owns the !task / !cancel / !tasks lifecycle. Construct
+    # AFTER the IRCBot (it needs `bot` for posting results) and wire back
+    # via attribute assignment to break the chicken-and-egg. Startup cleanup
+    # runs BEFORE IRC connect so we never observe a stale 'running' task as
+    # the live state from a previous bot lifetime.
+    task_runner = TaskRunner(
+        cfg=cfg,
+        db=db,
+        agent=agent,
+        chat_client=chat_client,
+        http=http,
+        ircbot=client,
+    )
+    client.task_runner = task_runner
+    try:
+        cleaned = await task_runner.startup_cleanup()
+        if cleaned:
+            log.info("Marked %d stale 'running' task(s) as cancelled (restart)", cleaned)
+    except Exception:
+        log.exception("task_runner startup_cleanup failed")
+
     try:
         log.info("Connecting to %s:%d (tls=%s)", cfg.server.host, cfg.server.port, cfg.server.tls)
         await client.connect(
@@ -358,6 +380,18 @@ async def run(cfg: Config, shutdown_event: asyncio.Event) -> None:
             await scheduler.stop()
         except Exception:
             log.exception("error stopping scheduler")
+
+        # Cancel any running tasks. Each task's runner coroutine handles
+        # the cancellation: posts a brief "[task #N] interrupted by
+        # shutdown" line to its channel and updates the DB row. We do this
+        # BEFORE goodbyes so the channel sees task notifications first, then
+        # the personality goodbye, then the QUIT — conversational order.
+        try:
+            cancelled = await task_runner.shutdown_all()
+            if cancelled:
+                log.info("Cancelled %d running task(s) during shutdown", cancelled)
+        except Exception:
+            log.exception("task_runner shutdown_all failed")
 
         # Per-channel goodbyes. Posts a short in-character farewell in each
         # channel with recent chat, capped by goodbye_timeout_sec across the
