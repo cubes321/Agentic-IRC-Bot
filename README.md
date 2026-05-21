@@ -107,11 +107,26 @@ Tools are gated per channel:
 Requires Python 3.11+.
 
 ```bash
+# 1. Create a virtual environment (recommended; isolates the bot's deps
+#    from your global Python install).
+python -m venv .venv
+
+# 2. Activate it.
+#    Windows PowerShell:  .\.venv\Scripts\Activate.ps1
+#    Windows cmd:         .\.venv\Scripts\activate.bat
+#    Unix / macOS:        source .venv/bin/activate
+
+# 3. Install dependencies into the venv.
 pip install -r requirements.txt
+
+# 4. Create your local config.
 cp sample-config.toml config.toml
 # edit config.toml — at minimum: [server].nick, channels, [ai].chat_model,
 # and (if using Quakenet) [server.quakenet].q_account + q_password_file
 ```
+
+Once the venv exists, `start.bat` (Windows) invokes the venv's Python
+directly, so you don't need to activate it every time you start the bot.
 
 **Windows path note:** in TOML basic strings, backslashes are escape
 characters. For a Windows-style path like `E:\…\qpass.txt`, either:
@@ -132,10 +147,28 @@ In LM Studio:
 
 ## Run
 
+If the venv is activated:
+
 ```bash
 python -m bot.main config.toml          # normal
 python -m bot.main -v config.toml       # DEBUG to console; file always gets DEBUG
 ```
+
+If you'd rather not activate, invoke the venv's Python directly:
+
+```bash
+# Windows
+.\.venv\Scripts\python.exe -m bot.main config.toml
+# or just:
+start.bat
+
+# Unix / macOS
+./.venv/bin/python -m bot.main config.toml
+```
+
+`start.bat` is the recommended launcher on Windows — it uses the venv's
+Python without changing the current shell's state, so the bot runs in
+isolation even if you forgot to `Activate.ps1`.
 
 The bot logs connection progress, channel joins, every engagement decision,
 every tool call, every initiative tick decision (speak / silent / skipped),

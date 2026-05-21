@@ -9,7 +9,15 @@ breaking changes freely until a `1.0.0` release).
 
 ## [Unreleased]
 
-(Nothing yet.)
+### Changed
+- `start.bat` now invokes the venv's `python.exe` directly rather than
+  whatever `python` is on the system PATH. Bot runs in its own isolated
+  dependency set regardless of shell activation state.
+
+### Docs
+- README setup section: explicit venv creation step (Windows + Unix
+  invocations). Run section: documents both activated and direct-invocation
+  paths.
 
 ## [0.1.0] - 2026-05-20
 
