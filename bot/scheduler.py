@@ -225,8 +225,12 @@ class Scheduler:
             log.info("Goodbye: no channels with chat in the last %ds", threshold)
             return
 
+        # NB: "considering" not "posting" — each channel's outcome is still
+        # one of (posted | silent | LLM error | send error). The per-channel
+        # log lines below show the actual outcome at INFO level, so the
+        # caller can tell which channels actually got a goodbye line.
         log.info(
-            "Goodbye: posting farewell to %d channel(s): %s (budget %.0fs)",
+            "Goodbye: considering farewell in %d channel(s): %s (budget %.0fs)",
             len(eligible), ", ".join(eligible), timeout_sec,
         )
 
@@ -331,7 +335,12 @@ class Scheduler:
             log.debug("goodbye: stripped %d chars of <think> reasoning in %s", removed, channel)
 
         if _is_silent_signal(text):
-            log.debug("goodbye: %s -> silent", channel)
+            # Bumped from DEBUG to INFO: the parent "considering farewell in
+            # N channel(s)" line is INFO, so its outcomes should be visible
+            # at the same level. Otherwise the operator sees "I'll try 2
+            # channels" with no follow-up at default log level and can't
+            # tell silence from a bug.
+            log.info("goodbye: %s -> silent (raw=%r)", channel, text[:80])
             return
 
         log.info("goodbye: %s posting %r", channel, text[:120])

@@ -70,17 +70,20 @@ Output:
 
 GOODBYE_SYSTEM = """You are {persona}
 
-You are in IRC channel {channel} as {nick}. The bot operator is shutting the bot down{reason_clause}. Say a brief goodbye to the channel in character — one short sentence, addressed to the channel as a whole (not to any single user). Do not include your nickname as a prefix.
+You are in IRC channel {channel} as {nick}. The bot operator is shutting you down right now{reason_clause}. Post a brief in-character goodbye before disconnecting. The channel has had recent activity from real users — they deserve a quick farewell rather than a silent disappearance. Default to speaking; silence is reserved for rare edge cases only (see below).
 
 Recent channel activity (most recent last):
 {recent}
 
-Guidance:
-- One short sentence, in character. Acknowledge the parting context only if it adds something natural (don't just parrot "shutting down").
-- If the channel had a live conversation, a goodbye that fits the topic is better than a generic one ("catch you all on the other side of this restart" is fine; "I'm signing off after that great Python discussion" is better).
-- If the recent activity is just bot output, idle chatter with no engagement, or feels weird to interrupt with a goodbye, output exactly the literal string <silent> with no other text — silence is fine.
+How to write the goodbye:
+- One short sentence. Address the channel as a whole, not any single user.
+- Stay in character per your persona. A witty bot waves with personality; a terse bot says "back soon" and means it.
+- If a recent topic in the buffer invites a tie-in, lean into it ("good luck with the deadlift goals, catch you next time" beats "bye everyone"). If not, a simple farewell line is fine.
+- Do NOT prefix your nickname. Do NOT wrap the message in quotes. Do NOT use IRC actions like /me or *waves* — plain text only.
 
-Output: either the goodbye text directly (no preamble, no quotes) or the literal token <silent>.
+Output exactly the goodbye text, nothing else. No preamble, no quotes, no thinking tags.
+
+Rare silence exception: if the recent buffer contains NO messages from real users (only your own prior bot output, or only a single ping with no engagement), AND no real conversation has taken place, output exactly the literal token <silent> instead. This should be very rare — if any real user has spoken in the last few minutes, write the goodbye.
 """
 
 MEMORY_EXTRACTOR_SYSTEM = """You extract memorable facts about users in an IRC channel from a chat transcript.
