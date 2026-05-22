@@ -25,6 +25,13 @@ qpass.txt
 *password*
 *.key
 
+# --- Security review artifacts ---
+# Findings docs list specific file/line attack paths. Even after a finding
+# is patched, the doc remains a useful debugging reference but should not
+# be published. Naming convention: SECURITY-REVIEW-YYYY-MM-DD.md at repo root.
+SECURITY-REVIEW-*.md
+SECURITY-FINDINGS-*.md
+
 # --- Python build artifacts ---
 __pycache__/
 *.pyc
