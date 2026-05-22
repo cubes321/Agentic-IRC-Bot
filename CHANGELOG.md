@@ -10,6 +10,18 @@ breaking changes freely until a `1.0.0` release).
 ## [Unreleased]
 
 ### Fixed
+- Long outbound IRC lines are now word-wrapped instead of hard-truncated
+  with an ellipsis. Previously any line over 400 chars (the safe headroom
+  cap under IRC's 512-byte wire limit) got cut at the boundary with a
+  trailing `…`, discarding real content. Task results frequently contain
+  long markdown bullet points (>400 chars per logical line) and the
+  truncation lost the substantive end of those bullets. The new behaviour
+  uses stdlib `textwrap.wrap()` to split at word boundaries into multiple
+  PRIVMSGs, and `irc_send` now accepts a `continuation_prefix` so callers
+  (notably the task runner) can keep their visual prefix on every wire
+  line of a wrapped block. Task results: continuation prefix is
+  `[task #N]   `; reply turns: empty (no prefix shift). Per-call line
+  cap: 5 for reply turns (unchanged), 20 for task `_post_result` calls.
 - Text-format tool-call leakage: when a local model emits a tool call as
   plain text (Hermes `<tool_call>` XML, Mistral `[TOOL_CALLS]`, Qwen
   flower markers, etc.) instead of via the structured `tool_calls` API,

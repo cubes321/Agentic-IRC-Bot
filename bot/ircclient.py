@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import textwrap
 from typing import Any
 
 import httpx
@@ -655,22 +656,81 @@ class IRCBot(pydle.Client):
             account = info.get("account") or info.get("identified_as")
         self.auth.remember_account(nick, account)
 
-    async def irc_send(self, target: str, text: str) -> None:
+    async def irc_send(
+        self,
+        target: str,
+        text: str,
+        *,
+        continuation_prefix: str = "",
+        max_lines: int | None = None,
+    ) -> None:
+        """Send `text` to `target` as one or more PRIVMSGs.
+
+        Behaviour:
+        - Splits `text` on newlines; empty / whitespace-only lines are dropped.
+        - Each remaining line is sanitised (control chars stripped, ends
+          trimmed) and then **word-wrapped** to fit MAX_LINE_LEN. Earlier
+          revisions hard-truncated at the byte boundary with an ellipsis,
+          which discarded real content for long task results; word-wrap
+          preserves all the text at the cost of more PRIVMSGs.
+        - `continuation_prefix` is prepended to every wrap-continuation
+          chunk (NOT the first chunk of each logical line — the caller
+          has already done any first-line prefixing). textwrap's
+          `subsequent_indent` does this for us and accounts for the
+          indent in the width budget, so each emitted wire-line is
+          ≤ MAX_LINE_LEN total.
+        - `max_lines` caps total wire-lines emitted per call (default
+          MAX_LINES_PER_REPLY). Tasks pass a higher number; reply turns
+          keep the existing cap to prevent runaway flooding.
+
+        Failure mode: any exception from the underlying `self.message`
+        call aborts the rest of the send for this invocation and is
+        logged. The remaining text is dropped (acceptable; the caller
+        usually has the full text stored elsewhere — DB row for tasks,
+        log_message row for replies).
+        """
         if not text:
             return
+        cap = MAX_LINES_PER_REPLY if max_lines is None else max_lines
         sent = 0
         for raw in text.splitlines():
-            if sent >= MAX_LINES_PER_REPLY:
+            if sent >= cap:
                 break
             cleaned = "".join(c for c in raw if c.isprintable() or c == " ").strip()
             if not cleaned:
                 continue
-            if len(cleaned) > MAX_LINE_LEN:
-                cleaned = cleaned[: MAX_LINE_LEN - 1] + "…"  # ellipsis
-            try:
-                await self.message(target, cleaned)
-            except Exception:
-                log.exception("failed to send line to %s", target)
-                return
-            sent += 1
-            await asyncio.sleep(INTER_LINE_DELAY)
+            # Word-wrap. `subsequent_indent` is the per-continuation prefix;
+            # textwrap subtracts its length from the width when budgeting
+            # the wrapped chunks, so each output line is ≤ MAX_LINE_LEN
+            # total. `break_long_words=True` is a fallback for cases like
+            # a single 500-char URL with no spaces (rare but defensible).
+            # `break_on_hyphens=False` keeps hyphenated phrases like
+            # "off-book" or "Netflix-style" intact on one line.
+            chunks = textwrap.wrap(
+                cleaned,
+                width=MAX_LINE_LEN,
+                subsequent_indent=continuation_prefix,
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
+            if not chunks:
+                # Defensive — wrap should never return [] for non-empty input
+                # with break_long_words=True, but if continuation_prefix is
+                # absurdly long the fallback keeps us functional.
+                chunks = [cleaned[:MAX_LINE_LEN]]
+            for chunk in chunks:
+                if sent >= cap:
+                    break
+                # Safety net: if `continuation_prefix` alone is longer
+                # than MAX_LINE_LEN (caller error), textwrap can still
+                # emit an over-length chunk. Hard-truncate here as the
+                # last line of defence.
+                if len(chunk) > MAX_LINE_LEN:
+                    chunk = chunk[:MAX_LINE_LEN - 1] + "…"
+                try:
+                    await self.message(target, chunk)
+                except Exception:
+                    log.exception("failed to send line to %s", target)
+                    return
+                sent += 1
+                await asyncio.sleep(INTER_LINE_DELAY)

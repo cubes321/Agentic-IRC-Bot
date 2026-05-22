@@ -400,8 +400,15 @@ class TaskRunner:
         result_text: str,
     ) -> None:
         """Post the task's outcome to the channel with a [task #N] prefix.
-        Each line of multi-line results gets the same prefix so IRC clients
-        render them as a coherent block.
+        Each logical line of multi-line results gets the same prefix so IRC
+        clients render them as a coherent block.
+
+        Long logical lines (>400 chars; common for markdown bullets in task
+        results) are word-wrapped by `bot.irc_send`; each wrap-continuation
+        also carries the `[task #N]` prefix so every wire line stays
+        identifiable as part of the same task block. `max_lines=20` per
+        irc_send call gives generous headroom for one logical line to
+        wrap into many sub-lines without truncation.
 
         Failure modes (network drop, channel parted) are logged but not
         retried — the result is in the DB; the channel post is best-effort.
@@ -413,15 +420,34 @@ class TaskRunner:
                 prefix = f"[task #{task_id}] "
             else:
                 prefix = f"[task #{task_id}] {status}: "
-            # First line gets the prefix; continuation lines get a thinner
-            # prefix so blocks are visually grouped without being shouty.
+            # Continuation prefix: visible task ID plus 3-space indent.
+            # Used both for new logical lines (between-line continuations)
+            # AND for wrap continuations of a single long logical line —
+            # one consistent shape so readers don't have to distinguish
+            # 'new bullet' from 'wrapped continuation' at the prefix layer.
+            cont_prefix = f"[task #{task_id}]   "
+
             lines = [ln for ln in result_text.splitlines() if ln.strip()]
             if not lines:
                 lines = [result_text or "(no result)"]
-            first = prefix + lines[0]
-            await self.bot.irc_send(channel, first)
+
+            # First logical line: prefix is the status-aware variant (e.g.
+            # `[task #5] cancelled: ` for cancelled tasks); wrap
+            # continuations of this line use the lighter `[task #5]   ` form.
+            await self.bot.irc_send(
+                channel, prefix + lines[0],
+                continuation_prefix=cont_prefix,
+                max_lines=20,
+            )
+            # Subsequent logical lines: use the lighter prefix for the
+            # first chunk too — they are by definition continuations of
+            # the task-result block.
             for ln in lines[1:]:
-                await self.bot.irc_send(channel, f"[task #{task_id}]   {ln}")
+                await self.bot.irc_send(
+                    channel, cont_prefix + ln,
+                    continuation_prefix=cont_prefix,
+                    max_lines=20,
+                )
         except Exception:
             log.exception(
                 "task #%d: failed to post result to %s (result stored in DB)",
