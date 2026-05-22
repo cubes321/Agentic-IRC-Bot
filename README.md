@@ -80,6 +80,20 @@ with first-class support for **Quakenet** authentication.
 - Shutdown cancels any running tasks with a brief channel notice before
   the bot disconnects.
 
+**Direct-message gate** (`bot/ircclient.py`, `[dm]` config)
+- DMs are private and invisible to channel ops, so an open DM channel is
+  a foot-gun: random users can DM the bot and trigger LLM/tool calls
+  with no oversight. The `[dm].mode` policy gates engagement at the
+  source account level:
+  - `ignore`: silently drop every DM
+  - `operators` (default): only `[operator].accounts` may DM
+  - `allowlist`: operators + explicit `[dm].allowed_accounts`
+  - `all`: anyone (legacy / public-help-bot use case)
+- Identity is the sender's services account, never their nick. Users
+  without an account can't pass any mode except `all`.
+- Dropped DMs are logged at INFO so the operator can see who's trying;
+  the sender gets no confirmation, so spammers get nothing to game.
+
 **Graceful shutdown** (`bot/main.py`, `bot/ircclient.py`)
 - Operator-only `!quit [parting message]` IRC command.
 - SIGINT/SIGTERM (Unix) and KeyboardInterrupt (Windows) route through the
@@ -188,7 +202,10 @@ and the token-usage summary on exit.
 
 ## Operating
 
-- **Mention or DM** the bot to engage normally.
+- **Mention or DM** the bot to engage normally. DM access is gated by
+  the `[dm]` config policy — by default, only accounts listed in
+  `[operator].accounts` can DM the bot. See the "Direct messages" section
+  below.
 - **`!memory_stats`** in any channel: prints per-channel memory totals,
   kinds breakdown, top users.
 - **`!task <goal>`**: schedule a multi-step background task. The bot will
@@ -244,6 +261,9 @@ The full schema is in [`sample-config.toml`](sample-config.toml). Highlights:
   `tick_skip_if_last_message_older_than_sec` (necropost defense).
 - `[shutdown]`: `quit_message`, `grace_sec`, `goodbye_recent_sec`,
   `goodbye_timeout_sec`.
+- `[dm]`: direct-message policy. `mode` (`ignore` | `operators` (default) |
+  `allowlist` | `all`) and `allowed_accounts` (for `allowlist` mode). See
+  "Direct messages" below.
 - `[memory].extractor_batch_size`: how often to fire the memory extractor
   (every N public messages per channel).
 - `[channels."#name"]`: per-channel `mode`, `persona`, `task_issuers`,

@@ -103,6 +103,27 @@ goodbye_recent_sec = 900
 # hanging on a slow LLM.
 goodbye_timeout_sec = 30
 
+[dm]
+# Direct-message policy. Channels are public; DMs are private and not
+# visible to channel ops — so without a gate, hostile users can engage
+# the bot privately and burn LLM/tool calls. This setting controls who
+# can DM the bot. Identity is always by services ACCOUNT (e.g. Q
+# account), never by nick (nicks are trivially impersonated).
+#
+# Modes:
+#   "ignore"     — silently drop every DM. Strictest.
+#   "operators"  — only accounts in [operator].accounts may DM. Default;
+#                  safe baseline. Use this unless you have a reason not to.
+#   "allowlist"  — operators + accounts explicitly listed below in
+#                  allowed_accounts. Use to grant DM access to known friends.
+#   "all"        — anyone may DM. The pre-2026 behaviour. Only use this
+#                  if you specifically need anonymous DM access, e.g. for
+#                  a public-help bot.
+mode = "operators"
+# Accounts that may DM the bot in "allowlist" mode. Operators ALWAYS pass
+# regardless of this list, so don't repeat them here. Ignored in other modes.
+allowed_accounts = []
+
 [ignore]
 nicks = ["Q", "ChanServ", "NickServ"]
 

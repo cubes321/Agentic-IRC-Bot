@@ -9,6 +9,28 @@ breaking changes freely until a `1.0.0` release).
 
 ## [Unreleased]
 
+### Added
+- Direct-message policy gate (`[dm]` config section). Channels are public
+  but DMs are private and invisible to channel ops — without a gate,
+  any IRC user could DM the bot and trigger LLM/tool calls (web_search,
+  fetch_url, etc.) with no oversight. Four modes:
+  - `ignore`: drop all DMs silently
+  - `operators` (default): only `[operator].accounts` can DM
+  - `allowlist`: operators + explicit `[dm].allowed_accounts`
+  - `all`: pre-2026 behaviour (anyone can DM)
+
+  Identity for the gate is always the sender's services account, never
+  their nick (nicks are trivially impersonated). Users without a
+  registered account can't pass any mode except `all`. Dropped DMs are
+  logged at INFO; the sender gets no response so spammers can't
+  fingerprint the bot. Applies to both DM messages and DM `/me` actions.
+
+  **Behaviour change for existing deployments:** the default switches
+  from "anyone can DM" to "operators only." If your bot has users who
+  legitimately DM it without operator status, set `[dm].mode = "all"`
+  or move them to `[dm].mode = "allowlist"` with their accounts in
+  `allowed_accounts`.
+
 ### Fixed
 - Long outbound IRC lines are now word-wrapped instead of hard-truncated
   with an ellipsis. Previously any line over 400 chars (the safe headroom

@@ -290,8 +290,18 @@ class IRCBot(pydle.Client):
             asyncio.create_task(self._cmd_issue_task(target, source, cmd_text))
             return
 
-        # Engagement: DMs always engage; channel messages need a mention.
+        # Engagement: channel messages need a mention; DMs need to pass the
+        # [dm] policy gate. The gate is account-based — random IRC users
+        # cannot trigger LLM/tool calls just by /msg-ing the bot. See DmCfg
+        # in config.py for mode semantics. Drops are silent + logged so the
+        # operator can see who's trying without spammers getting feedback.
         if not is_dm and not self._mention_re.search(message):
+            return
+        if is_dm and not await self._should_engage_dm(source):
+            log.info(
+                "DM dropped from %s (mode=%s): not authorised",
+                source, self.cfg.dm.mode,
+            )
             return
 
         # Make sure we have an account cached if possible.
@@ -361,9 +371,17 @@ class IRCBot(pydle.Client):
             log.debug("Ignoring action from %s: shutdown in progress", by)
             return
 
-        # Engagement: DMs (rare for actions, but possible) always engage;
-        # channel actions need a mention of the bot's nick in the action text.
+        # Engagement: channel actions need a mention of the bot's nick;
+        # DM actions go through the same [dm] policy gate as DM messages.
+        # Without this gate, a hostile user could send "/me does X to Bot"
+        # in a query window and bypass the message-level filter.
         if not is_dm and not self._mention_re.search(contents):
+            return
+        if is_dm and not await self._should_engage_dm(by):
+            log.info(
+                "DM action dropped from %s (mode=%s): not authorised",
+                by, self.cfg.dm.mode,
+            )
             return
 
         await self._ensure_account_known(by)
@@ -655,6 +673,37 @@ class IRCBot(pydle.Client):
         if isinstance(info, dict):
             account = info.get("account") or info.get("identified_as")
         self.auth.remember_account(nick, account)
+
+    async def _should_engage_dm(self, source: str) -> bool:
+        """Apply the [dm] policy gate. Returns True if the source may
+        engage the bot via DM under the current configured mode.
+
+        Always identifies via the sender's services ACCOUNT, never their
+        nick — nick spoofing makes nick-based authorisation worthless.
+        Users without an account cannot pass any mode except 'all',
+        encouraging account registration for privileged access.
+
+        Resolution cost: at most one WHOIS per nick per 5-minute cache
+        window (the account-cache TTL). Spam DMs from the same nick
+        share a single WHOIS; this gate is cheap under load.
+        """
+        mode = self.cfg.dm.mode
+        if mode == "ignore":
+            return False
+        if mode == "all":
+            return True
+        # 'operators' and 'allowlist' both depend on the sender's account.
+        await self._ensure_account_known(source)
+        account = self._cached_account_or_none(source)
+        if self.auth.is_operator(account):
+            return True
+        if mode == "operators":
+            return False
+        # 'allowlist': operators always pass (handled above) PLUS explicit
+        # accounts. None-account users never match an allowlist.
+        if account and account in self.cfg.dm.allowed_accounts:
+            return True
+        return False
 
     async def irc_send(
         self,

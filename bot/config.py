@@ -103,6 +103,40 @@ class StorageCfg(BaseModel):
     log_path: str = "bot.log"       # debug log file (INFO+ to console, DEBUG+ to file)
 
 
+class DmCfg(BaseModel):
+    """Direct-message policy. Controls who can engage the bot via DM.
+
+    Channels are public and have their own per-channel policies; DMs are
+    bot-wide and were unrestricted in early development. That turned out
+    to be a foot-gun — any user on the network could DM the bot and
+    trigger LLM/tool calls (web_search, fetch_url, etc.), wasting compute
+    and giving trolls a private engagement channel invisible to channel
+    ops. This policy gates DM engagement at the source-account level.
+
+    Mode semantics:
+      'ignore'     — silently drop every DM. Strictest. The bot still
+                     receives the message and may log it for the operator
+                     but never invokes the agent loop.
+      'operators'  — only accounts in [operator].accounts may DM.
+                     The default; safe baseline for fresh deployments.
+      'allowlist'  — operators (always pass) + accounts explicitly listed
+                     in [dm].allowed_accounts.
+      'all'        — anyone may DM. Restores pre-2026-05 behaviour;
+                     explicit opt-in for users who want public DM access.
+
+    Identity for the gate is the sender's services ACCOUNT (e.g. Q
+    account on Quakenet), NOT their nick. Nicks are trivially
+    impersonated; accounts require credentials. Users without an account
+    cannot pass any mode except 'all' — encouraging account registration
+    for privileged access is intentional.
+    """
+    mode: Literal["all", "operators", "allowlist", "ignore"] = "operators"
+    # Accounts allowed to DM in 'allowlist' mode. Operators always pass
+    # regardless of this list. Empty list in 'allowlist' mode means
+    # "operators only" (same effect as mode='operators').
+    allowed_accounts: list[str] = Field(default_factory=list)
+
+
 class ShutdownCfg(BaseModel):
     """Graceful-shutdown knobs. Used by !quit, SIGINT, SIGTERM, KeyboardInterrupt."""
     # Goodbye line sent as the IRC QUIT message. Channels see this in the
@@ -168,6 +202,7 @@ class Config(BaseModel):
     scheduler: SchedulerCfg = Field(default_factory=SchedulerCfg)
     storage: StorageCfg = Field(default_factory=StorageCfg)
     shutdown: ShutdownCfg = Field(default_factory=ShutdownCfg)
+    dm: DmCfg = Field(default_factory=DmCfg)
     ignore: IgnoreCfg = Field(default_factory=IgnoreCfg)
     channels: dict[str, ChannelCfg] = Field(default_factory=dict)
 
