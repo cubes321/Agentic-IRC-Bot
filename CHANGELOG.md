@@ -9,6 +9,49 @@ breaking changes freely until a `1.0.0` release).
 
 ## [Unreleased]
 
+### Security
+- **[SEC C1]** SSRF mitigation. `fetch_url`, `look_at_image`, and
+  `youtube_info` previously accepted any HTTP(S) URL with no host
+  validation and `follow_redirects=True`, letting an LLM-mediated
+  request target `127.0.0.1`, RFC 1918 ranges, link-local
+  (`169.254.169.254` cloud-metadata), and any other non-globally-routable
+  address. Classified as CRITICAL in the 2026-05-22 security review.
+
+  New module `bot/url_safety.py` exposes:
+  - `is_safe_url(url)` — verifies scheme is http/https AND every IP the
+    host resolves to passes `ipaddress.is_global` (rejects loopback,
+    link-local, RFC 1918, RFC 4193, multicast, reserved, unspecified).
+    Multi-A-record-safe (rejects if ANY resolved IP is unsafe).
+  - `safe_fetch(http, url, ...)` — drop-in replacement for buffered
+    `http.request()` with manual redirect following. Re-runs the safety
+    check on every hop. Caps redirect chain at 5.
+  - `safe_stream(http, url, ...)` — same but for streaming responses
+    (used by the vision tool's image cap). Closes and reopens the
+    stream on each redirect so the safety check runs in-band.
+
+  Tool changes:
+  - `bot/tools/url.py:_fetch_url` — calls `safe_fetch`, catches
+    `UnsafeURLError`, returns "refusing to fetch" rather than raising.
+  - `bot/tools/vision.py:_fetch_image` — uses `safe_stream`. Same
+    catch-and-return shape.
+  - `bot/tools/youtube.py:_youtube_info` — pre-validates the URL host
+    against an allowlist of YouTube domains (`youtube.com`, `youtu.be`,
+    `youtube-nocookie.com` and their subdomains) before handing off to
+    yt-dlp's extractor. Rejects boundary-trick subdomains
+    (`evil-youtube.com` etc.) via explicit dot-prefix matching.
+
+  Verified with a 23-case smoke test covering loopback IPv4/IPv6,
+  hostnames resolving to loopback, all RFC 1918 ranges, AWS metadata
+  endpoint, IPv6 link-local, unspecified/multicast, non-HTTP schemes,
+  garbage input, and positive cases (real public URLs). YouTube
+  allowlist verified against legit YT subdomains and deliberate
+  boundary-trick negative cases.
+
+  Residual risk: DNS rebinding (host resolves benignly during
+  validation, then re-resolves to internal address during the actual
+  connect). Mitigated only by keeping the window small. Documented in
+  `bot/url_safety.py` module docstring.
+
 ### Added
 - Direct-message policy gate (`[dm]` config section). Channels are public
   but DMs are private and invisible to channel ops — without a gate,

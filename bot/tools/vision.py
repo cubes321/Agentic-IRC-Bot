@@ -18,6 +18,7 @@ import httpx
 from openai import APIError, APIConnectionError, NotFoundError, BadRequestError
 
 from . import Tool, ToolContext, register
+from ..url_safety import safe_stream, UnsafeURLError
 
 log = logging.getLogger(__name__)
 
@@ -48,15 +49,19 @@ async def _fetch_image(http: httpx.AsyncClient, url: str) -> tuple[bytes, str] |
     success, or a dict containing {'error': ...} on validation failure.
 
     Mixing return types lets the caller short-circuit cleanly without an
-    exception ladder for what are really just user-input errors."""
+    exception ladder for what are really just user-input errors.
+
+    Uses `bot.url_safety.safe_stream` so the SSRF gate runs on every hop
+    of any redirect chain. The previous follow_redirects=True path was
+    the C1 finding's exploit vector for the vision tool — an attacker
+    could redirect from a public URL to 127.0.0.1 mid-fetch."""
     if not url.startswith(("http://", "https://")):
         return {"error": "image_url must start with http:// or https://"}
     try:
-        # Streamed fetch so we can abort mid-download if the response is huge.
-        async with http.stream(
-            "GET", url,
+        # safe_stream wraps http.stream() with per-hop URL validation.
+        async with safe_stream(
+            http, url,
             timeout=HTTP_TIMEOUT,
-            follow_redirects=True,
             headers={"User-Agent": USER_AGENT, "Accept": "image/*"},
         ) as r:
             if r.status_code >= 400:
@@ -96,6 +101,8 @@ async def _fetch_image(http: httpx.AsyncClient, url: str) -> tuple[bytes, str] |
                     }
                 chunks.append(chunk)
             return b"".join(chunks), ctype
+    except UnsafeURLError as e:
+        return {"error": f"refusing to fetch image: {e}"}
     except (httpx.RequestError, asyncio.TimeoutError) as e:
         return {"error": f"network error fetching image: {e}"}
 

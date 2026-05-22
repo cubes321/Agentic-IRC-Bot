@@ -1,15 +1,59 @@
 """YouTube metadata via yt-dlp. Ported from the legacy script's
-get_youtube_video_info(); same options, same output shape."""
+get_youtube_video_info(); same options, same output shape.
+
+Host-restricted (security review finding C1, 2026-05-22): the tool
+description says "YouTube" but the underlying yt-dlp generic extractor
+will probe arbitrary URLs trying to find video data. Letting it accept
+any URL turned yt-dlp into a third SSRF surface alongside fetch_url and
+look_at_image. We now pre-validate the host against an allowlist of
+YouTube domains before handing off to yt-dlp."""
 
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
 import logging
+from urllib.parse import urlparse
 
 from . import Tool, ToolContext, register
 
 log = logging.getLogger(__name__)
+
+
+# Allowlist of host suffixes accepted by youtube_info. We match by
+# suffix (so `m.youtube.com` and `www.music.youtube.com` both pass)
+# rather than exact host equality. Includes youtube-nocookie.com which
+# is the privacy-mode CDN YouTube uses for embedded players — same
+# content backend, distinct hostname, legitimate metadata source.
+_YOUTUBE_HOST_SUFFIXES = (
+    "youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+)
+
+
+def _is_youtube_url(url: str) -> tuple[bool, str]:
+    """Return (ok, reason). True if the URL's host is in the YouTube
+    allowlist; False with a human-readable reason otherwise."""
+    try:
+        parsed = urlparse(url)
+    except Exception as e:
+        return False, f"could not parse URL: {e}"
+    if parsed.scheme not in ("http", "https"):
+        return False, f"unsupported scheme: {parsed.scheme!r}"
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False, "URL has no hostname"
+    for suffix in _YOUTUBE_HOST_SUFFIXES:
+        # Exact match OR subdomain (host ends with .suffix). Plain
+        # `endswith(suffix)` would falsely accept "evil-youtube.com",
+        # so we require the boundary "." or full equality.
+        if host == suffix or host.endswith("." + suffix):
+            return True, ""
+    return False, (
+        f"host {host!r} is not a YouTube domain "
+        f"(accepted suffixes: {', '.join(_YOUTUBE_HOST_SUFFIXES)})"
+    )
 
 
 def _fetch_sync(url: str) -> dict:
@@ -40,6 +84,9 @@ async def _youtube_info(ctx: ToolContext, args: dict) -> dict:
     url = args["url"]
     if not url.startswith(("http://", "https://")):
         return {"error": "url must start with http:// or https://"}
+    ok, reason = _is_youtube_url(url)
+    if not ok:
+        return {"error": f"refusing to fetch: {reason}"}
     return await asyncio.to_thread(_fetch_sync, url)
 
 

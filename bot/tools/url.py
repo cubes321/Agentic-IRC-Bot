@@ -1,4 +1,9 @@
-"""Fetch a URL and return readable text. Generalises the old !tldr command."""
+"""Fetch a URL and return readable text. Generalises the old !tldr command.
+
+URLs go through `bot.url_safety.safe_fetch` so that requests targeting
+loopback, RFC 1918, link-local (incl. cloud metadata 169.254.169.254),
+or any non-globally-routable address are refused. See the SSRF mitigation
+notes in `bot/url_safety.py` and security review finding C1 (2026-05-22)."""
 
 from __future__ import annotations
 
@@ -8,6 +13,7 @@ import logging
 import httpx
 
 from . import Tool, ToolContext, register
+from ..url_safety import safe_fetch, UnsafeURLError
 
 log = logging.getLogger(__name__)
 
@@ -45,12 +51,21 @@ async def _fetch_url(ctx: ToolContext, args: dict) -> dict:
     if not url.startswith(("http://", "https://")):
         return {"error": "url must start with http:// or https://"}
     try:
-        r = await ctx.http.get(
+        # safe_fetch enforces the SSRF gate on every hop of the redirect
+        # chain — the original `follow_redirects=True` path was the C1
+        # finding's primary exploit vector (attacker-controlled redirect
+        # to 127.0.0.1 after the URL check).
+        r = await safe_fetch(
+            ctx.http,
             url,
             timeout=15.0,
-            follow_redirects=True,
             headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.5"},
         )
+    except UnsafeURLError as e:
+        # Surfaced verbatim to the LLM so it can tell the user (and the
+        # log captures the reason for operator review). Not an "error"
+        # the model can retry around — this is a policy decision.
+        return {"error": f"refusing to fetch: {e}", "url": url}
     except (httpx.RequestError, asyncio.TimeoutError) as e:
         return {"error": f"network error: {e}"}
     if r.status_code >= 400:
