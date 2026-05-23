@@ -138,6 +138,34 @@ async def _set_topic(ctx: ToolContext, args: dict) -> dict:
         return {"error": "topic is empty"}
     if not _is_channel(ctx.channel):
         return {"error": f"set_topic can only be used in a channel, not in {ctx.channel}"}
+
+    # Actor gating (security review M2, 2026-05-22). Once a channel has
+    # allow_actions=["topic"], the set_topic tool is in the catalog for
+    # every reply turn — meaning any mention-capable user can rewrite
+    # the topic via the bot if the bot has +o. This check requires the
+    # requester to be an operator (bot-wide) OR a channel-op on
+    # ctx.channel, matching the implicit trust assumption that topic
+    # changes should require someone the channel has already trusted.
+    auth = getattr(ctx.bot, "auth", None)
+    if auth is None:
+        # Defensive: if the bot somehow lacks an auth manager (shouldn't
+        # happen in normal operation), refuse rather than fall through.
+        return {"error": "auth manager unavailable; refusing to set topic"}
+    is_operator = auth.is_operator(ctx.actor_account)
+    is_channel_op = auth.is_op_in_channel(ctx.channel, ctx.actor_nick)
+    if not (is_operator or is_channel_op):
+        log.info(
+            "set_topic refused: %s (account=%r) is neither operator nor "
+            "channel-op of %s",
+            ctx.actor_nick, ctx.actor_account, ctx.channel,
+        )
+        return {
+            "error": (
+                f"refusing to set topic in {ctx.channel}: only operators "
+                "or channel-ops (+o) can change the topic via the bot."
+            ),
+        }
+
     # Pydle's set_topic sends TOPIC #chan :text. Falls back to rawmsg for
     # maximum portability if the method is absent on an older pydle.
     try:
@@ -163,11 +191,14 @@ async def _set_topic(ctx: ToolContext, args: dict) -> dict:
 register(Tool(
     name="set_topic",
     description=(
-        "Set the topic of the current channel. The bot must be opped (+o) or "
-        "the channel must allow non-op topic changes (mode -t) for this to "
-        "take effect — the IRCd silently rejects unauthorised TOPIC commands. "
-        "Returns 'sent' on transmission, not 'applied'; if the topic does not "
-        "change in the channel, the bot lacks permission. Channel-only."
+        "Set the topic of the current channel. The REQUESTING USER must be "
+        "an operator (bot-wide) or a channel-op (+o) on this channel — "
+        "otherwise the call is refused. The bot must ALSO be opped (+o) or "
+        "the channel must allow non-op topic changes (mode -t) for the "
+        "change to actually apply; the IRCd silently rejects unauthorised "
+        "TOPIC commands. Returns 'sent' on transmission, not 'applied'; "
+        "if the topic does not change in the channel, the bot lacks "
+        "permission. Channel-only."
     ),
     schema={
         "type": "object",

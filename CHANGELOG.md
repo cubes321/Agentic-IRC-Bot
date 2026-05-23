@@ -244,6 +244,16 @@ breaking changes freely until a `1.0.0` release).
 
   Closes review finding H3.
 
+- **[SEC M2]** `set_topic` requires the requesting user to be an
+  operator OR a channel-op of the target channel. Pre-fix, once a
+  channel had `allow_actions = ["topic"]`, any mention-capable user
+  could rewrite the topic via the bot — the IRCd-level check on the
+  BOT's ops was the only barrier. Now the bot also checks the
+  REQUESTER's status. Implementation in `bot/tools/irc_native.py`
+  via `ctx.bot.auth.is_operator()` / `is_op_in_channel()`. The tool
+  description now states the actor requirement so the LLM doesn't
+  attempt the call from unprivileged contexts. Closes review finding M2.
+
 - **[SEC M1]** `private_msg` now requires the actor and target to share
   a channel. Pre-2026-05, once a channel had `allow_actions = ["msg"]`,
   the LLM could DM any nick on the network — the per-target rate limit
