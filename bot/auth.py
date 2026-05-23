@@ -21,6 +21,12 @@ from .policy import ActorContext
 log = logging.getLogger(__name__)
 
 CACHE_TTL_SEC = 300
+# Tighter TTL for operator-tier accounts: ex-operators should lose
+# privilege quickly after de-auth. (Security review L1, 2026-05-22.)
+# Non-operator cached entries keep the 5-min TTL; the cost of one
+# extra WHOIS per operator-cache-miss-per-minute is negligible
+# compared to a 5-minute privilege grace window.
+OPERATOR_CACHE_TTL_SEC = 60
 
 
 @dataclass
@@ -44,12 +50,22 @@ class AuthManager:
         self._account_cache[nick] = (account, time.monotonic())
 
     def get_cached(self, nick: str) -> str | None | object:
-        """Returns the account (str or None) if cached & fresh; sentinel _MISS otherwise."""
+        """Returns the account (str or None) if cached & fresh; sentinel
+        _MISS otherwise.
+
+        TTL is OPERATOR_CACHE_TTL_SEC (60s) for cached entries whose
+        account is in operator_accounts, CACHE_TTL_SEC (300s) otherwise.
+        Tighter operator TTL shortens the privilege grace window after
+        an operator de-auths or the operator_accounts set is changed at
+        runtime — see L1 in the 2026-05-22 security review."""
         entry = self._account_cache.get(nick)
         if entry is None:
             return _MISS
         account, fetched = entry
-        if time.monotonic() - fetched > CACHE_TTL_SEC:
+        # Operator entries get the shorter TTL; non-operator (including
+        # None-account) entries keep the longer one.
+        ttl = OPERATOR_CACHE_TTL_SEC if self.is_operator(account) else CACHE_TTL_SEC
+        if time.monotonic() - fetched > ttl:
             self._account_cache.pop(nick, None)
             return _MISS
         return account

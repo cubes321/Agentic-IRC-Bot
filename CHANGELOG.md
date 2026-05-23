@@ -52,6 +52,13 @@ breaking changes freely until a `1.0.0` release).
   connect). Mitigated only by keeping the window small. Documented in
   `bot/url_safety.py` module docstring.
 
+- **[SEC L1]** Operator-tier cached accounts now use a tighter TTL
+  (60s vs the regular 300s) in `AuthManager.get_cached`. Shortens
+  the privilege grace window after an operator de-authenticates from
+  services or is removed from `operator_accounts` at runtime: was up
+  to 5 minutes, now up to 1 minute. Non-operator entries keep the
+  300s TTL — those accounts have no privileges to leak.
+
 - **[SEC L5]** `set_reminder.target_nick` strips IRC channel-prefix
   characters at insert time. Without this, an LLM passing
   `target_nick = "#geeks"` produced a fire-time post like
