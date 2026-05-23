@@ -244,6 +244,54 @@ breaking changes freely until a `1.0.0` release).
 
   Closes review finding H3.
 
+- **[SEC M3]** Soft-delete on memories + audit table for Tier-5 actions
+  and `forget`. Pre-fix, `MemoryStore.forget()` did a physical
+  `DELETE FROM memories WHERE id = ?` — gone forever, no forensic trail.
+  Same for Tier-5 IRC actions (`me_action`, `set_topic`, `private_msg`):
+  the channel saw them, the bot logged them at INFO, but nothing
+  durable for review weeks later.
+
+  Schema changes (`bot/db.py`, additive — backward compatible):
+  - `memories.deleted_at TEXT` (nullable; NULL = active, ISO timestamp
+    = soft-deleted). Set via `UPDATE` in the new `MemoryStore.forget`
+    rather than the old physical DELETE.
+  - New `audit` table (id, ts, actor_account, actor_nick, channel,
+    action, details JSON). Append-only by design — no code path
+    UPDATEs or DELETEs from it. Indexed by `ts` and `action`.
+  - Idempotent migration: `Database._migrate()` runs `ALTER TABLE
+    memories ADD COLUMN deleted_at TEXT` and catches the "duplicate
+    column" error so re-opening an already-migrated DB is a no-op.
+
+  Behaviour changes:
+  - `recall` and `_channel_vectors` filter `deleted_at IS NULL` so
+    soft-deleted memories are invisible to all read paths — the LLM
+    can't surface them via the `recall` tool, dedup at insert time
+    doesn't compare against them, auto-recall doesn't prepend them.
+  - `memory_stats` (`!memory_stats` chat command) also filters
+    `deleted_at IS NULL` — operator sees the same count the LLM sees.
+  - `forget` is now idempotent for already-soft-deleted rows
+    (returns `forgotten: true, note: "memory was already forgotten"`).
+
+  Audit log calls added in:
+  - `_forget` (memory.forget) — payload includes memory_id, kind,
+    user_account, content_preview.
+  - `_set_topic` — payload includes the new topic text.
+  - `_private_msg` — payload includes target_nick + message_preview.
+    Channel field is the SOURCING channel (where the request came
+    from), not the DM target.
+  - `_me_action` — payload includes the action text.
+
+  `Database.log_audit()` swallows its own exceptions: an audit-write
+  failure must never poison the user-facing action that the audit is
+  recording. Audit is best-effort by design.
+
+  Verified with a 4-case smoke test against a fresh temp DB: schema
+  includes deleted_at + audit, log_audit round-trips, migration is
+  idempotent on re-open, memory_stats correctly excludes soft-deleted
+  rows from its count.
+
+  Closes review finding M3.
+
 - **[SEC M5]** Periodic channel-op state refresh defends against
   pydle missing a MODE event (netsplit, reconnect race, etc.) which
   would leave the bot's cached op set stale and possibly

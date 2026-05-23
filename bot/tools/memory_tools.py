@@ -145,8 +145,11 @@ async def _forget(ctx: ToolContext, args: dict) -> dict:
     # Look up the memory FIRST so we can report its content back to the LLM.
     # If the LLM mistakenly picks the wrong id, the human will see exactly
     # what was deleted in the bot's reply ("I removed: 'X'") and can correct.
+    # Includes deleted_at so we can distinguish "already-forgotten" from
+    # "never existed" — soft-deleted rows still exist for audit (M3).
     row = await ctx.db.fetchone(
-        "SELECT id, kind, user_account, content, channel FROM memories WHERE id = ?",
+        "SELECT id, kind, user_account, content, channel, deleted_at "
+        "FROM memories WHERE id = ?",
         (memory_id,),
     )
     if row is None:
@@ -161,8 +164,37 @@ async def _forget(ctx: ToolContext, args: dict) -> dict:
                 f"({ctx.channel}). Run recall() in {row['channel']} to manage it."
             ),
         }
+    if row["deleted_at"] is not None:
+        # Already soft-deleted on a previous call. Idempotent success;
+        # don't double-audit and don't pretend we did the work.
+        return {
+            "forgotten": True,
+            "id": memory_id,
+            "kind": row["kind"],
+            "user_account": row["user_account"],
+            "content": row["content"],
+            "note": "memory was already forgotten",
+        }
 
     ok = await ctx.memory.forget(memory_id)
+
+    # Audit log (M3): record who forgot what, when, with content preview.
+    # Best-effort — log_audit catches its own failures so an audit-write
+    # error never poisons the user-facing outcome of the forget itself.
+    if ok:
+        await ctx.db.log_audit(
+            action="memory.forget",
+            channel=ctx.channel,
+            actor_nick=ctx.actor_nick,
+            actor_account=ctx.actor_account,
+            details={
+                "memory_id": memory_id,
+                "kind": row["kind"],
+                "user_account": row["user_account"],
+                "content_preview": (row["content"] or "")[:200],
+            },
+        )
+
     return {
         "forgotten": ok,
         "id": memory_id,

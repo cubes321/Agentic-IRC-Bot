@@ -269,18 +269,42 @@ class MemoryStore:
         return new_id
 
     async def forget(self, memory_id: int) -> bool:
-        row = await self.db.fetchone("SELECT id FROM memories WHERE id = ?", (memory_id,))
+        """Soft-delete a memory: UPDATE deleted_at = now WHERE id = ?.
+
+        Pre-M3 this physical-DELETEd the row. Now it just flags the
+        row deleted; recall() and _channel_vectors() filter
+        `deleted_at IS NULL` so the row is invisible to all read paths,
+        but it stays present for forensic audit (paired with the
+        audit-table INSERT in the _forget tool, security review M3).
+
+        Returns True if the row exists and is now flagged deleted (by
+        this call OR by a previous one — idempotent for already-deleted
+        rows). Returns False only if no row with that id exists at all.
+        """
+        row = await self.db.fetchone(
+            "SELECT id, deleted_at FROM memories WHERE id = ?", (memory_id,),
+        )
         if not row:
             return False
-        await self.db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        if row["deleted_at"] is not None:
+            return True  # already soft-deleted; idempotent success
+        await self.db.execute(
+            "UPDATE memories SET deleted_at = ? "
+            "WHERE id = ? AND deleted_at IS NULL",
+            (now_utc_iso(), memory_id),
+        )
         return True
 
     # ---- read ----
 
     async def _channel_vectors(self, channel: str) -> np.ndarray:
-        """Return an (N, dim) matrix of unit-normalised embeddings for a channel."""
+        """Return an (N, dim) matrix of unit-normalised embeddings for a channel.
+        Filters out soft-deleted memories (deleted_at IS NOT NULL) so dedup
+        at insert time doesn't compare against rows the LLM can't see
+        anyway. (M3.)"""
         rows = await self.db.fetchall(
-            "SELECT embedding FROM memories WHERE channel = ? AND embedding IS NOT NULL",
+            "SELECT embedding FROM memories "
+            "WHERE channel = ? AND embedding IS NOT NULL AND deleted_at IS NULL",
             (channel,),
         )
         if not rows:
@@ -297,7 +321,8 @@ class MemoryStore:
             return []
         rows = await self.db.fetchall(
             "SELECT id, kind, user_account, content, created_at, embedding "
-            "FROM memories WHERE channel = ? AND embedding IS NOT NULL",
+            "FROM memories "
+            "WHERE channel = ? AND embedding IS NOT NULL AND deleted_at IS NULL",
             (channel,),
         )
         if not rows:

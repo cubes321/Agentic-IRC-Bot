@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +21,8 @@ CREATE TABLE IF NOT EXISTS memories (
   kind TEXT NOT NULL,
   content TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  embedding BLOB
+  embedding BLOB,
+  deleted_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_mem_channel ON memories(channel);
 
@@ -81,6 +83,23 @@ CREATE TABLE IF NOT EXISTS token_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_usage_ts ON token_usage(ts);
 CREATE INDEX IF NOT EXISTS idx_usage_purpose ON token_usage(purpose);
+
+-- Forensic audit trail for Tier-5 IRC actions (me_action / set_topic /
+-- private_msg) and memory.forget. Each row records who did what when,
+-- with action-specific details as a JSON blob. Append-only by design;
+-- there's no UPDATE or DELETE on this table from any code path.
+-- (Security review M3, 2026-05-22.)
+CREATE TABLE IF NOT EXISTS audit (
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL,
+  actor_account TEXT,
+  actor_nick TEXT,
+  channel TEXT,
+  action TEXT NOT NULL,
+  details TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit(action);
 """
 
 
@@ -107,10 +126,44 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL;")
         await self._conn.execute("PRAGMA foreign_keys=ON;")
+        # CREATE TABLE IF NOT EXISTS is safe on fresh + existing DBs.
+        # Stripping ';' lets us run multi-statement strings.
         for stmt in [s for s in SCHEMA.split(";") if s.strip()]:
             await self._conn.execute(stmt)
         await self._conn.commit()
+        # Migrations: additive schema changes for existing DBs. Each is
+        # idempotent (catches "duplicate column" so re-running is safe).
+        # New deployments get the columns via the CREATE TABLE statements
+        # above; the ALTER paths are no-ops for them.
+        await self._migrate()
         log.info("Database opened at %s", self.path)
+
+    async def _migrate(self) -> None:
+        """Apply additive schema migrations to existing DBs.
+
+        SQLite's ALTER TABLE ADD COLUMN raises OperationalError
+        ('duplicate column name') if the column already exists; we
+        swallow that specific case so the migration is idempotent.
+        Anything else is a real failure and gets logged. New rows in
+        the new columns get NULL by default."""
+        migrations: list[tuple[str, str]] = [
+            # (description, SQL) — keep ordered by introduction date for clarity.
+            ("memories.deleted_at column (M3, 2026-05-22)",
+             "ALTER TABLE memories ADD COLUMN deleted_at TEXT"),
+        ]
+        for desc, sql in migrations:
+            try:
+                await self._conn.execute(sql)
+                await self._conn.commit()
+                log.info("migration applied: %s", desc)
+            except aiosqlite.OperationalError as e:
+                msg = str(e).lower()
+                if "duplicate column" in msg:
+                    log.debug("migration no-op (already present): %s", desc)
+                else:
+                    log.exception("migration failed: %s — sql=%r", desc, sql)
+            except Exception:
+                log.exception("migration failed unexpectedly: %s", desc)
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -216,6 +269,37 @@ class Database:
              total, purpose, channel),
         )
 
+    async def log_audit(
+        self,
+        *,
+        action: str,
+        channel: str | None,
+        actor_nick: str | None,
+        actor_account: str | None,
+        details: dict | None = None,
+    ) -> None:
+        """Record a security-relevant action (Tier-5 IRC, memory.forget) to
+        the `audit` table for forensic review. Failures are caught and
+        logged — audit is best-effort; never raise out of this call,
+        because raising here would interfere with the action that the
+        audit is recording. (Security review M3, 2026-05-22.)"""
+        try:
+            await self.execute(
+                "INSERT INTO audit "
+                "(ts, actor_account, actor_nick, channel, action, details) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    now_utc_iso(),
+                    actor_account,
+                    actor_nick,
+                    channel,
+                    action,
+                    json.dumps(details or {}, default=str),
+                ),
+            )
+        except Exception:
+            log.exception("audit log failed for action=%s channel=%s", action, channel)
+
     async def usage_summary(
         self,
         since_iso: str | None = None,
@@ -279,9 +363,18 @@ class Database:
 
     async def memory_stats(self, channel: str | None = None) -> dict:
         """Per-channel memory statistics for the !memory_stats command.
-        Returns counts, oldest/newest dates, and per-kind breakdown."""
-        where = " WHERE channel = ?" if channel else ""
-        params: tuple = (channel,) if channel else ()
+        Returns counts, oldest/newest dates, and per-kind breakdown.
+        Only counts ACTIVE memories (deleted_at IS NULL); soft-deleted
+        rows are excluded so the operator sees the same total the LLM
+        sees via recall. (M3.)"""
+        # The base condition is "active row" — deleted_at IS NULL.
+        # Channel filter is layered on top when supplied.
+        if channel:
+            where = " WHERE channel = ? AND deleted_at IS NULL"
+            params: tuple = (channel,)
+        else:
+            where = " WHERE deleted_at IS NULL"
+            params = ()
 
         totals = await self.fetchone(
             "SELECT COUNT(*) AS n, "

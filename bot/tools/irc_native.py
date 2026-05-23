@@ -98,6 +98,14 @@ async def _me_action(ctx: ToolContext, args: dict) -> dict:
         log.exception("me_action failed in %s", ctx.channel)
         return {"error": f"send failed: {e}"}
     log.info("me_action in %s: %r", ctx.channel, text[:120])
+    # Audit (M3): record the action for forensic review.
+    await ctx.db.log_audit(
+        action="me_action",
+        channel=ctx.channel,
+        actor_nick=ctx.actor_nick,
+        actor_account=ctx.actor_account,
+        details={"text": text},
+    )
     return {"sent": True, "channel": ctx.channel, "text": text}
 
 
@@ -180,6 +188,16 @@ async def _set_topic(ctx: ToolContext, args: dict) -> dict:
         log.exception("set_topic failed in %s", ctx.channel)
         return {"error": f"send failed: {e}"}
     log.info("set_topic in %s: %r", ctx.channel, text[:120])
+    # Audit (M3): record who changed the topic to what. Captures the
+    # SEND, not the apply — if the IRCd rejects it (no +o), the audit
+    # row still says we tried, which is the relevant fact for review.
+    await ctx.db.log_audit(
+        action="set_topic",
+        channel=ctx.channel,
+        actor_nick=ctx.actor_nick,
+        actor_account=ctx.actor_account,
+        details={"topic": text},
+    )
     # Note: we report 'sent' rather than 'confirmed' because IRC TOPIC is
     # fire-and-forget at this layer — the server may still reject it for
     # permission reasons (numeric 482) which arrives as a server message,
@@ -377,6 +395,16 @@ async def _private_msg(ctx: ToolContext, args: dict) -> dict:
     log.info(
         "private_msg to %s (from %s in %s): %r",
         target, ctx.actor_nick, ctx.channel, text[:120],
+    )
+    # Audit (M3): record the DM. `channel` is the SOURCING channel — the
+    # one the actor requested the DM from — not the DM target itself.
+    # `details` carries the target nick and a preview of the message.
+    await ctx.db.log_audit(
+        action="private_msg",
+        channel=ctx.channel,
+        actor_nick=ctx.actor_nick,
+        actor_account=ctx.actor_account,
+        details={"target_nick": target, "message_preview": text[:200]},
     )
     return {
         "sent": True,
