@@ -214,6 +214,50 @@ async def _check_and_record_dm(target_lower: str) -> tuple[bool, int]:
         return True, RATE_LIMIT - len(fresh)
 
 
+def _shares_channel(bot: Any, actor_nick: str, target_nick: str) -> bool:
+    """True if actor and target are both members of any channel the bot is
+    joined to.
+
+    Why this matters: pre-2026-05, the only check between
+    `allow_actions = ["msg"]` and "the LLM can DM any nick on the
+    network" was the per-target rate limit (3/60s) — which is bypassed
+    by spraying to many distinct targets. Combined with prompt
+    injection (security review H1), a malicious page could coerce the
+    bot into DMing up to step_cap distinct nicks per turn.
+
+    Requiring a shared channel reduces "DM anyone on the network" to
+    "DM someone the actor and bot both already have a relationship
+    with." Doesn't fully solve harassment routes — two users in the
+    same channel can use the bot as an intermediary — but it cuts the
+    abuse surface from "the entire network" to "channels the actor
+    inhabits," which is a meaningful collapse.
+
+    Implementation note: pydle stores per-channel user lists in
+    bot.channels[ch]['users']. The container type differs across pydle
+    versions (some return dict, some set/frozenset, some plain iter);
+    we defensively iterate-and-lowercase since IRC nicks are
+    case-insensitive on most networks. If pydle's data shape changes
+    in a future release this still functions — it just won't match.
+
+    (Security review M1, 2026-05-22.)
+    """
+    actor_lower = actor_nick.lower()
+    target_lower = target_nick.lower()
+    channels = getattr(bot, "channels", None) or {}
+    for ch_state in channels.values():
+        if not isinstance(ch_state, dict):
+            continue
+        users = ch_state.get("users") or ()
+        try:
+            user_nicks_lower = {str(u).lower() for u in users}
+        except TypeError:
+            # Unexpected user-list shape — treat as no match for safety.
+            continue
+        if actor_lower in user_nicks_lower and target_lower in user_nicks_lower:
+            return True
+    return False
+
+
 async def _private_msg(ctx: ToolContext, args: dict) -> dict:
     target = (args.get("target_nick") or "").strip()
     if not target:
@@ -227,6 +271,24 @@ async def _private_msg(ctx: ToolContext, args: dict) -> dict:
         }
     if target.lower() == ctx.bot.nickname.lower():
         return {"error": "refusing to DM myself"}
+
+    # Common-channel gate: refuse to DM nicks the requester doesn't share
+    # a channel with. Without this, the rate-limit (per-target) was the
+    # only thing between an LLM-controlled turn and "DM any nick on the
+    # network." Placed BEFORE the rate-limit check so a refusal doesn't
+    # consume rate budget. (Security review M1, 2026-05-22.)
+    if not _shares_channel(ctx.bot, ctx.actor_nick, target):
+        log.info(
+            "private_msg refused: %s and %s share no channel with the bot",
+            ctx.actor_nick, target,
+        )
+        return {
+            "error": (
+                f"refusing to DM {target}: I can only DM users who share at "
+                f"least one channel with you. private_msg is not a way to "
+                f"reach arbitrary nicks on the network."
+            ),
+        }
 
     text = (args.get("message") or "").strip()
     if not text:
@@ -264,12 +326,15 @@ async def _private_msg(ctx: ToolContext, args: dict) -> dict:
 register(Tool(
     name="private_msg",
     description=(
-        "Send a private message (DM) to a specific user. Rate-limited to "
-        f"{RATE_LIMIT} DMs per {int(RATE_WINDOW_SEC)}s per target across all "
-        "channels — be sparing. Use only when the message is specifically for "
-        "that user and would be noise in the channel (e.g. delivering a "
-        "private reminder, sharing a long quote, replying to a sensitive "
-        "question). For normal channel conversation, just reply in the channel."
+        "Send a private message (DM) to a specific user. The target MUST "
+        "share at least one channel with the requesting user — DMing arbitrary "
+        "nicks on the network is refused for harassment-prevention reasons. "
+        f"Rate-limited to {RATE_LIMIT} DMs per {int(RATE_WINDOW_SEC)}s per "
+        "target across all channels — be sparing. Use only when the message "
+        "is specifically for that user and would be noise in the channel "
+        "(e.g. delivering a private reminder, sharing a long quote, replying "
+        "to a sensitive question). For normal channel conversation, just "
+        "reply in the channel."
     ),
     schema={
         "type": "object",

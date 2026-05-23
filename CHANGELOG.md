@@ -52,6 +52,31 @@ breaking changes freely until a `1.0.0` release).
   connect). Mitigated only by keeping the window small. Documented in
   `bot/url_safety.py` module docstring.
 
+- **[SEC M1]** `private_msg` now requires the actor and target to share
+  a channel. Pre-2026-05, once a channel had `allow_actions = ["msg"]`,
+  the LLM could DM any nick on the network — the per-target rate limit
+  (3/60s) was the only protection, and spraying to many distinct
+  targets bypassed it. Combined with prompt injection from fetched
+  content (H1), one malicious page could direct the bot to DM-spray
+  up to `step_cap` distinct nicks per turn.
+
+  New helper `_shares_channel(bot, actor, target)` walks pydle's
+  `bot.channels` and returns True only if both nicks are members of at
+  least one channel the bot is in (case-insensitive; defensive against
+  pydle data-shape variation). The check fires before the rate-limit
+  check (so refusals don't consume rate budget) and before message
+  validation (so error returns are fast). The tool description was
+  updated so the LLM knows the requirement up front.
+
+  Doesn't fully solve harassment (two users in the same channel can
+  still use the bot as an intermediary) but cuts the abuse surface
+  from "the entire network" to "channels the actor inhabits" — a
+  meaningful collapse. Verified with a 10-case smoke test covering
+  matching/non-matching, case-insensitive, multi-channel, plus the
+  defensive cases for missing/wrong-shape pydle state.
+
+  Closes review finding M1.
+
 - **[SEC L3]** Redact DM content in INFO-level logs. The `on_message`
   and `on_ctcp_action` engagement paths previously logged the user's
   message text at INFO (e.g. `Engaging in #foo for alice: 'pizza?'`)
