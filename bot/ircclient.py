@@ -186,14 +186,24 @@ class IRCBot(pydle.Client):
 
     async def on_mode_change(self, channel: str, modes: list, by: str) -> None:
         """Re-sync the channel's op set whenever any channel mode changes.
-
-        In pydle, `self.channels[channel]['modes']` is a dict keyed by *mode
-        letter*. Parameter-taking modes (`o`, `v`, `h`, `b`, `e`, `I`, `k`)
-        store a list/string of parameters; flag modes (`i`, `m`, `n`, `s`,
-        `t`, `C`) store a bool. We only care about `'o'` — the list of
-        nicks currently holding `+o` on this channel.
-        """
+        Delegates to resync_channel_ops; see there for the shape logic."""
         await super().on_mode_change(channel, modes, by)
+        self.resync_channel_ops(channel)
+
+    def resync_channel_ops(self, channel: str) -> None:
+        """Re-read the channel's op set from pydle's parsed mode dict and
+        push it into the auth manager.
+
+        Called from on_mode_change (event-driven, primary path) AND from
+        the scheduler's periodic op-state refresh (defensive, M5 backup
+        for missed mode events around netsplits / reconnects).
+
+        In pydle, `self.channels[channel]['modes']` is a dict keyed by
+        *mode letter*. Parameter-taking modes (`o`, `v`, `h`, `b`, `e`,
+        `I`, `k`) store a list/string of parameters; flag modes (`i`,
+        `m`, `n`, `s`, `t`, `C`) store a bool. We only care about `'o'`
+        — the list of nicks currently holding `+o` on this channel.
+        """
         try:
             ch_state = self.channels.get(channel) or {}
             modes_dict = ch_state.get("modes") or {}
@@ -207,14 +217,28 @@ class IRCBot(pydle.Client):
             else:
                 # Unexpected shape; leave the cache untouched rather than guessing.
                 log.debug(
-                    "on_mode_change: unexpected modes['o'] type %s for %s",
+                    "resync_channel_ops: unexpected modes['o'] type %s for %s",
                     type(op_value).__name__, channel,
                 )
                 return
             self.auth.set_channel_ops(channel, ops)
             log.debug("ops in %s: %s", channel, sorted(ops) or "(none)")
         except Exception:
-            log.exception("on_mode_change op resync failed for %s", channel)
+            log.exception("resync_channel_ops failed for %s", channel)
+
+    async def refresh_channel_state(self, channel: str) -> None:
+        """Send a NAMES query to ask pydle to refresh its parsed state
+        for the channel. Fire-and-forget — pydle processes the reply
+        asynchronously and updates `self.channels[channel]`. Pair this
+        with a brief wait + resync_channel_ops() to get fresh op data
+        after a suspected desync. (Security review M5, 2026-05-22.)
+        """
+        try:
+            await self.rawmsg("NAMES", channel)
+        except Exception:
+            # Non-fatal: NAMES failures shouldn't break the bot. The
+            # resync just won't have new data this cycle.
+            log.debug("NAMES refresh for %s failed (non-fatal)", channel)
 
     # ---- message handling ----
 

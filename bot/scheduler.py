@@ -399,14 +399,19 @@ class Scheduler:
                 for channel, ch_rows in by_channel.items():
                     await self._fire_channel_batch(channel, ch_rows)
 
-                # Periodic retention prune. Both reminders (orphans +
-                # failed-fire cleanup) AND message_log (channel-transcript
-                # retention from [storage].message_log_retention_days,
-                # security review L2). Runs in-loop on the same hourly
-                # cadence — separate prunes, shared trigger.
+                # Periodic housekeeping. Three independent maintenance
+                # tasks share the same hourly trigger:
+                #   - prune old reminders (orphans + failed-fire cleanup, H3)
+                #   - prune old message_log rows (retention from
+                #     [storage].message_log_retention_days, L2)
+                #   - refresh per-channel op state (defensive against
+                #     missed mode events around netsplits, M5)
+                # All three are cheap enough that one hourly cycle
+                # handles them with no dedicated coroutines.
                 if time.monotonic() - last_prune > self.REMINDER_PRUNE_INTERVAL_SEC:
                     await self._prune_old_reminders()
                     await self._prune_old_messages()
+                    await self._refresh_channel_op_state()
                     last_prune = time.monotonic()
 
                 # Sleep but wake early if stop is signalled.
@@ -475,6 +480,46 @@ class Scheduler:
                 )
         except Exception:
             log.exception("reminder retention prune failed")
+
+    async def _refresh_channel_op_state(self) -> None:
+        """Send NAMES for each joined channel and re-sync the op set.
+        Defensive backup against pydle missing a MODE event during
+        netsplits, reconnects, or other edge events that would otherwise
+        leave `auth.is_op_in_channel()` returning stale data. Runs on
+        the same hourly cadence as the retention prunes.
+
+        Two-phase: trigger NAMES for every channel, sleep briefly to
+        let pydle process replies, then re-read pydle's parsed channel
+        state into our auth manager. Self-healing within one cycle if
+        pydle's view was stale. (Security review M5, 2026-05-22.)"""
+        bot_channels = getattr(self.bot, "channels", None) or {}
+        channels = list(bot_channels)
+        if not channels:
+            return
+        log.debug(
+            "op-state refresh: requesting NAMES for %d channel(s)", len(channels),
+        )
+        for ch in channels:
+            try:
+                await self.bot.refresh_channel_state(ch)
+            except Exception:
+                log.debug("op-state refresh: NAMES failed for %s", ch)
+        # Give pydle a beat to process the NAMES replies into
+        # self.channels[*]['modes'] before we re-read them. 2s is
+        # generous on a healthy connection (typical reply ~50ms) and
+        # tolerable on a slow one.
+        try:
+            await asyncio.wait_for(self._stopping.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        if self._stopping.is_set():
+            return
+        for ch in channels:
+            try:
+                self.bot.resync_channel_ops(ch)
+            except Exception:
+                log.exception("op-state resync failed for %s", ch)
+        log.debug("op-state refresh complete (%d channels)", len(channels))
 
     async def _prune_old_messages(self) -> None:
         """Delete message_log rows older than

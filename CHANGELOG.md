@@ -244,6 +244,18 @@ breaking changes freely until a `1.0.0` release).
 
   Closes review finding H3.
 
+- **[SEC M5]** Periodic channel-op state refresh defends against
+  pydle missing a MODE event (netsplit, reconnect race, etc.) which
+  would leave the bot's cached op set stale and possibly
+  mis-authorize `task_issuers="ops"` decisions. Extracted the
+  existing `on_mode_change` resync logic into a reusable
+  `IRCBot.resync_channel_ops(channel)` method; added a companion
+  `refresh_channel_state(channel)` that sends a raw NAMES query so
+  pydle re-parses its `self.channels[channel]` state. The
+  scheduler's hourly housekeeping now invokes both for every joined
+  channel: NAMES request → 2-second wait for pydle to process →
+  re-read into auth manager. Self-healing within one cycle.
+
 - **[SEC M2]** `set_topic` requires the requesting user to be an
   operator OR a channel-op of the target channel. Pre-fix, once a
   channel had `allow_actions = ["topic"]`, any mention-capable user
