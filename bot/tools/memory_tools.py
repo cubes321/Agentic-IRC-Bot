@@ -310,6 +310,16 @@ async def _set_reminder(ctx: ToolContext, args: dict) -> dict:
         }
 
     target_nick = args.get("target_nick") or ctx.actor_nick
+    # Strip IRC channel-prefix characters from target_nick: the LLM
+    # occasionally picks `target_nick = "#geeks"` which would produce a
+    # nonsense `reminder for #geeks: ...` post at fire time. Channel
+    # names start with #, &, +, or ! per RFC 2811 — strip those plus
+    # any leading whitespace so the resulting text reads sensibly.
+    # (Security review L5, 2026-05-22.)
+    target_nick = target_nick.lstrip(" \t#&+!")
+    if not target_nick:
+        target_nick = ctx.actor_nick  # fall back to requester if we stripped everything
+
     message = (args.get("message") or "").strip()
     if not message:
         return {"error": "message is empty"}

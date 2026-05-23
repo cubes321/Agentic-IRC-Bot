@@ -52,6 +52,14 @@ breaking changes freely until a `1.0.0` release).
   connect). Mitigated only by keeping the window small. Documented in
   `bot/url_safety.py` module docstring.
 
+- **[SEC L5]** `set_reminder.target_nick` strips IRC channel-prefix
+  characters at insert time. Without this, an LLM passing
+  `target_nick = "#geeks"` produced a fire-time post like
+  `"reminder for #geeks: ..."` — cosmetic but nonsensical. Strips
+  `#`, `&`, `+`, `!` (RFC 2811 channel prefixes) plus leading
+  whitespace; falls back to `ctx.actor_nick` if stripping consumes
+  the entire value.
+
 - **[SEC L4]** Periodic sweep of rate-limit dicts to prevent unbounded
   key growth. The reviewer's note suggested a one-line "drop key on
   empty fresh" change; in practice the existing helpers always APPEND
