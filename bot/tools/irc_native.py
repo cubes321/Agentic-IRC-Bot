@@ -195,14 +195,45 @@ register(Tool(
 # Resets on bot restart; that's acceptable for anti-spam (not for auditing).
 RATE_WINDOW_SEC = 60.0
 RATE_LIMIT = 3
+# Sweep interval for dropping stale keys. (Security review L4.) The
+# original reviewer note suggested dropping keys when `fresh` is empty
+# after pruning — but the existing code always appends on success, so
+# that case never arises. The real leak is keys for targets DMed once
+# and then never again: those entries persist with stale timestamps
+# forever. A periodic sweep (every SWEEP_INTERVAL_SEC) drops them.
+SWEEP_INTERVAL_SEC = 600.0  # 10 minutes
 _dm_history: dict[str, list[float]] = {}
 _dm_history_lock = asyncio.Lock()
+_dm_history_last_sweep: float = 0.0
+
+
+def _sweep_stale_rate_entries(
+    d: dict[str, list[float]],
+    window_sec: float,
+    now_monotonic: float,
+) -> int:
+    """Drop dict entries whose entire list is older than `window_sec` from
+    `now_monotonic`. Returns the count dropped. Caller must hold the
+    relevant lock. (L4.)"""
+    cutoff = now_monotonic - window_sec
+    stale_keys = [k for k, v in d.items() if not v or max(v) < cutoff]
+    for k in stale_keys:
+        del d[k]
+    return len(stale_keys)
 
 
 async def _check_and_record_dm(target_lower: str) -> tuple[bool, int]:
     """Returns (allowed, remaining_in_window). If not allowed, remaining=0."""
+    global _dm_history_last_sweep
     async with _dm_history_lock:
         now = time.monotonic()
+        # Periodic sweep of stale keys to prevent unbounded dict growth
+        # under long-running operation. Cheap: linear scan of items().
+        if now - _dm_history_last_sweep > SWEEP_INTERVAL_SEC:
+            dropped = _sweep_stale_rate_entries(_dm_history, RATE_WINDOW_SEC, now)
+            if dropped:
+                log.debug("dm rate-limit sweep: dropped %d stale key(s)", dropped)
+            _dm_history_last_sweep = now
         window_start = now - RATE_WINDOW_SEC
         hist = _dm_history.setdefault(target_lower, [])
         # Prune in place — keeps the dict from growing without bound for chatty targets.

@@ -52,6 +52,17 @@ breaking changes freely until a `1.0.0` release).
   connect). Mitigated only by keeping the window small. Documented in
   `bot/url_safety.py` module docstring.
 
+- **[SEC L4]** Periodic sweep of rate-limit dicts to prevent unbounded
+  key growth. The reviewer's note suggested a one-line "drop key on
+  empty fresh" change; in practice the existing helpers always APPEND
+  on the success path so that case never arises. The real leak is
+  entries for nicks/actors who got rate-counted once and then never
+  contacted the bot again — those entries persisted with stale
+  timestamps. Fixed by sweeping `_dm_history` (every 10 min, scoped
+  to the 60s rate window) and `_reminder_history` (every hour, scoped
+  to the 1h rate window). Sweeps run inside the existing locks, scan
+  is linear, no separate coroutine needed.
+
 - **[SEC H1]** Prompt-injection defences for fetched tool-result
   content. Pre-fix, a malicious page returned by `fetch_url` (or any
   other tool whose result contains attacker-controlled text — search

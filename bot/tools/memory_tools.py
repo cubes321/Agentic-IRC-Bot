@@ -242,17 +242,34 @@ def _td(seconds: int):
 _REMINDER_RATE_LIMIT = 5            # max creations per actor per window
 _REMINDER_RATE_WINDOW_SEC = 3600.0  # 1 hour
 _REMINDER_MAX_HORIZON_SEC = 90 * 86400  # 90 days — cap on `when`
+# See L4 in irc_native.py for the rationale on periodic sweeps. Same
+# pattern: actors who set a reminder once never have their entry
+# cleaned up otherwise.
+_REMINDER_SWEEP_INTERVAL_SEC = 3600.0  # 1 hour (matches the rate window)
 
 _reminder_history: dict[str, list[float]] = {}
 _reminder_history_lock = asyncio.Lock()
+_reminder_history_last_sweep: float = 0.0
 
 
 async def _check_reminder_rate(actor_key: str) -> tuple[bool, int]:
     """Returns (allowed, remaining_in_window). actor_key should be the
     requester's account (preferred) or `nick:<lowernick>` as fallback
     so account and nick namespaces can't collide."""
+    global _reminder_history_last_sweep
     async with _reminder_history_lock:
         now = time.monotonic()
+        # Periodic sweep: drop entries whose entire list is older than the
+        # rate window. Prevents unbounded dict growth under long-running
+        # operation. (Security review L4.)
+        if now - _reminder_history_last_sweep > _REMINDER_SWEEP_INTERVAL_SEC:
+            cutoff = now - _REMINDER_RATE_WINDOW_SEC
+            stale = [k for k, v in _reminder_history.items() if not v or max(v) < cutoff]
+            for k in stale:
+                del _reminder_history[k]
+            if stale:
+                log.debug("reminder rate sweep: dropped %d stale key(s)", len(stale))
+            _reminder_history_last_sweep = now
         window_start = now - _REMINDER_RATE_WINDOW_SEC
         hist = _reminder_history.get(actor_key, [])
         fresh = [t for t in hist if t >= window_start]
