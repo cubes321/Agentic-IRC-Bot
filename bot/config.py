@@ -114,6 +114,16 @@ class SchedulerCfg(BaseModel):
 class StorageCfg(BaseModel):
     db_path: str = "bot.sqlite"
     log_path: str = "bot.log"       # debug log file (INFO+ to console, DEBUG+ to file)
+    # Retention for the message_log SQLite table. Channel messages are
+    # captured for log_search, the recent-buffer renderer, and the
+    # memory extractor. Without retention the table grows forever —
+    # both a privacy concern (IRC users don't expect durable transcripts)
+    # and a disk-usage concern at long horizons. The scheduler's hourly
+    # prune deletes rows older than this many days. Set to 0 to disable
+    # pruning entirely (table grows monotonically). Default 90 days
+    # is enough for "what did X say about Y last quarter?" log_search
+    # queries while bounding the table size. (Security review L2.)
+    message_log_retention_days: int = 90
 
 
 class DmCfg(BaseModel):

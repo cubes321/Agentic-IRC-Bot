@@ -399,11 +399,14 @@ class Scheduler:
                 for channel, ch_rows in by_channel.items():
                     await self._fire_channel_batch(channel, ch_rows)
 
-                # Periodic retention prune (orphans + failed-fire cleanup).
-                # Runs in-loop rather than as its own coroutine — one DELETE
-                # per hour doesn't need a dedicated lifecycle.
+                # Periodic retention prune. Both reminders (orphans +
+                # failed-fire cleanup) AND message_log (channel-transcript
+                # retention from [storage].message_log_retention_days,
+                # security review L2). Runs in-loop on the same hourly
+                # cadence — separate prunes, shared trigger.
                 if time.monotonic() - last_prune > self.REMINDER_PRUNE_INTERVAL_SEC:
                     await self._prune_old_reminders()
+                    await self._prune_old_messages()
                     last_prune = time.monotonic()
 
                 # Sleep but wake early if stop is signalled.
@@ -472,6 +475,35 @@ class Scheduler:
                 )
         except Exception:
             log.exception("reminder retention prune failed")
+
+    async def _prune_old_messages(self) -> None:
+        """Delete message_log rows older than
+        cfg.storage.message_log_retention_days. Channel transcripts grow
+        without bound otherwise — both a privacy (IRC users don't expect
+        durable transcripts) and a disk-usage concern. (Security review
+        L2, 2026-05-22.)
+
+        retention_days = 0 disables the prune entirely (caller's choice;
+        the table just grows). Negative values are coerced to 0 here so
+        a misconfiguration can't accidentally delete recent messages."""
+        retention_days = max(0, int(self.cfg.storage.message_log_retention_days))
+        if retention_days == 0:
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        try:
+            async with self.db.conn.execute(
+                "DELETE FROM message_log WHERE ts < ?",
+                (cutoff.isoformat(),),
+            ) as cur:
+                deleted = cur.rowcount
+            await self.db.conn.commit()
+            if deleted > 0:
+                log.info(
+                    "Pruned %d message_log row(s) older than %d days",
+                    deleted, retention_days,
+                )
+        except Exception:
+            log.exception("message_log retention prune failed")
 
     async def _fire_reminder(self, row: Any) -> None:
         """Post a single reminder and delete it. On failure, leave the row

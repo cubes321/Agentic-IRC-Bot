@@ -52,6 +52,17 @@ breaking changes freely until a `1.0.0` release).
   connect). Mitigated only by keeping the window small. Documented in
   `bot/url_safety.py` module docstring.
 
+- **[SEC L2]** `message_log` retention. Channel messages were stored
+  for `log_search`, recent-buffer rendering, and the memory extractor,
+  but the table grew without bound — both a privacy concern (IRC users
+  don't expect durable transcripts) and a disk-usage concern at long
+  horizons. New `[storage].message_log_retention_days` config knob
+  (default 90); scheduler's hourly prune cycle now also DELETEs
+  message_log rows whose `ts` is older than the retention window.
+  Set to 0 to disable. New `Scheduler._prune_old_messages()` runs on
+  the same hourly trigger as the existing reminder retention prune,
+  so no separate coroutine lifecycle.
+
 - **[SEC L1]** Operator-tier cached accounts now use a tighter TTL
   (60s vs the regular 300s) in `AuthManager.get_cached`. Shortens
   the privilege grace window after an operator de-authenticates from
