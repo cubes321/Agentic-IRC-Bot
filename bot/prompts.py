@@ -109,6 +109,29 @@ DO NOT extract:
   - Quoted song lyrics, memes, or copypasta verbatim
   - Things the bot itself said
   - Bare URLs without context
+  - **Character claims, accusations, insults, or judgements ABOUT a person.**
+    Memories are durable; extracting "X is a scammer" / "Y is rude" /
+    "Z is a [pejorative]" weaponises the bot as a reputation-tampering
+    tool. People can manipulate what other people post; the bot's stored
+    "facts" should not let that into long-term channel memory.
+      - Negative opinions about TOPICS or THINGS are fine: "Bob hates
+        pineapple on pizza", "Alice thinks Rust is overrated".
+      - Negative claims about PEOPLE are out: "Bob is a liar",
+        "Alice is annoying", "Charlie is stupid".
+  - **Third-party claims about another user's identity, beliefs,
+    politics, or private behaviour.** If Bob says "Alice voted for X"
+    or "Alice is secretly Y", do not extract. Only extract things
+    people say about THEMSELVES, or that are verifiable in the channel
+    transcript itself.
+  - **Slurs, hate speech, threats, or harassment text in any form.**
+    Anything you would not say in a professional setting does not go
+    in long-term memory.
+
+Bias toward SELF-STATEMENTS over third-party statements:
+  - "alice: I'm learning Rust"     -> EXTRACT (fact about alice, said by alice)
+  - "bob: alice doesn't know Rust" -> DO NOT EXTRACT (third-party, may be wrong)
+  - "alice: I hate broccoli"       -> EXTRACT (opinion about a thing)
+  - "bob: alice is stupid"         -> DO NOT EXTRACT (insult about a person)
 
 When in doubt, EXTRACT. The system deduplicates near-identical facts automatically, so redundancy is fine. Only return [] if there is genuinely nothing — e.g. five lines of "hi" / "lol" / "afk".
 

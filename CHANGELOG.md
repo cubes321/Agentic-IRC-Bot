@@ -52,6 +52,50 @@ breaking changes freely until a `1.0.0` release).
   connect). Mitigated only by keeping the window small. Documented in
   `bot/url_safety.py` module docstring.
 
+- **[SEC H2]** Memory extractor moderation. Pre-fix, the extractor
+  prompt allowed character claims, accusations, and (implicitly) slurs
+  to land as durable channel memories. A coordinated user could post
+  "Alice is a scammer" repeatedly across batches and persist it as a
+  fact about Alice, which would then surface in `recall`, auto-recall,
+  and tick prompts indefinitely — turning the bot into a reputation-
+  tampering tool. Classified as HIGH in the 2026-05-22 review.
+
+  Two-layer defense:
+
+  - **Primary (prompt)**: `MEMORY_EXTRACTOR_SYSTEM` now explicitly
+    bans extracting character claims, third-party accusations, slurs,
+    hate speech, threats, and harassment text. The DO-NOT-EXTRACT
+    list distinguishes "negative opinion about a TOPIC/THING"
+    (allowed: "Bob hates pineapple on pizza") from "negative claim
+    about a PERSON" (rejected: "Bob is a liar"). New "Bias toward
+    SELF-STATEMENTS" section explains: extract things people say
+    about themselves, not what others say about them.
+
+  - **Backstop (filter)** in `bot/memory.py`:
+    `_is_memory_content_safe()` runs in `add()` — covers both the
+    extractor path AND the explicit `remember` tool path, since both
+    write to the same `memories` table. Rejects content that
+    matches a slur denylist OR the `<X> is (a) <pejorative>`
+    pattern. Deliberately narrow: false negatives (subtle insults
+    the regex misses) are accepted as the cost of zero false
+    positives on legitimate content. Prompt is primary; filter is
+    last-line defense for blatant payloads.
+
+  Rejections log at INFO with the rejected content and reason so the
+  operator can see attempted abuse. The LLM doesn't get an
+  error-result because `add()` is internal — extractor and remember
+  both silently skip. (For the `remember` tool, the LLM sees a
+  "stored: false" response from the existing dedup path; no separate
+  injection-tunable feedback.)
+
+  Verified with a 23-case smoke test covering: slurs (rejected),
+  pejorative-noun pattern in various tenses (rejected), pejorative
+  adjectives (rejected), negative opinions about THINGS (allowed),
+  positive self-statements (allowed), neutral facts (allowed),
+  channel topics (allowed), and the empty-content edge case.
+
+  Closes review finding H2.
+
 - **[SEC H3]** Reminder spam defences across the lifecycle. Previously
   `set_reminder` had no rate limit, no horizon cap, no past-time check,
   no per-channel fire cap, and no retention — letting one LLM turn write

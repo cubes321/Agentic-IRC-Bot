@@ -49,6 +49,69 @@ RECALL_FLOOR = 0.30             # drop results below this
 DEFAULT_RECALL_K = 5
 
 
+# ---- Negative-valence filter for stored memories (security review H2). ----
+#
+# The MEMORY_EXTRACTOR_SYSTEM prompt now explicitly bans extracting
+# character claims, slurs, and third-party accusations. This filter is a
+# defensive backstop: prompt is the primary control, this catches the
+# most-egregious payloads if the LLM lets one through. Applied at add()
+# so it covers BOTH the extractor path AND explicit `remember` tool
+# calls — the memories table is the durable surface, not the entry point.
+#
+# Deliberately narrow: only matches obvious slurs and the "<X> is/was
+# (a) <pejorative>" pattern. False negatives (subtle insults the regex
+# misses) are accepted as the cost of avoiding false positives on
+# legitimate content ("Bob hates pineapple", "Alice thinks Rust is
+# overrated" — both fine and shouldn't be filtered).
+
+# Pejorative nouns used in identity-attack form ("X is a scammer").
+_PEJORATIVE_NOUNS = (
+    "scammer", "liar", "fraud", "fraudster", "cheat", "cheater", "thief",
+    "stalker", "predator", "pedophile", "paedophile", "creep",
+    "racist", "sexist", "homophobe", "transphobe",
+    "nazi", "fascist", "terrorist", "rapist", "abuser",
+    "psycho", "sociopath", "narcissist",
+)
+# Pejorative adjectives used in identity-attack form ("X is dumb").
+_PEJORATIVE_ADJ = (
+    "stupid", "dumb", "retarded", "retard", "idiot", "moron", "imbecile",
+    "asshole", "bitch", "bastard", "cunt", "pathetic", "worthless",
+)
+# Slur terms — direct hate-speech vocabulary. Deliberately small list;
+# the prompt's "slurs/hate speech in any form" instruction is the
+# primary defense. We're catching the most-blatant payloads only.
+_SLUR_TERMS = (
+    "nigger", "nigga", "faggot", "tranny", "kike", "spic",
+    "chink", "wetback", "gook",
+)
+
+# Pattern: "<word> (is|was|are|were) (a|an)? <pejorative>"
+# Catches: "alice is a scammer", "Bob was an idiot", "they are racists"
+_IS_PEJORATIVE_RE = re.compile(
+    r"\b\w+\s+(?:is|was|are|were)\s+(?:an?\s+)?(?:"
+    + "|".join(_PEJORATIVE_NOUNS + _PEJORATIVE_ADJ)
+    + r")s?\b",
+    re.IGNORECASE,
+)
+_SLUR_RE = re.compile(
+    r"\b(?:" + "|".join(_SLUR_TERMS) + r")s?\b",
+    re.IGNORECASE,
+)
+
+
+def _is_memory_content_safe(content: str) -> tuple[bool, str]:
+    """Return (safe, reason). False if the content matches obvious
+    negative-valence patterns. The patterns are intentionally narrow:
+    this is a backstop, not a moderation system. Prompt is primary."""
+    if not content:
+        return True, ""  # empty content fails elsewhere; not our concern
+    if _SLUR_RE.search(content):
+        return False, "contains slur or hate-speech term"
+    if _IS_PEJORATIVE_RE.search(content):
+        return False, "matches '<who> is (a) <pejorative>' pattern"
+    return True, ""
+
+
 class _ExtractedFact(BaseModel):
     kind: str = Field(pattern=r"^(fact|preference|event|topic)$")
     user_account: str | None = None
@@ -161,7 +224,25 @@ class MemoryStore:
         user_account: str | None = None,
         dedup: bool = True,
     ) -> int | None:
-        """Insert a memory. Returns the new row id, or None if deduped."""
+        """Insert a memory. Returns the new row id, or None if deduped or
+        filtered.
+
+        Filtering: content goes through `_is_memory_content_safe` first
+        (security review H2, 2026-05-22). Stops obvious slurs and
+        "<X> is (a) <pejorative>" patterns from being durably stored.
+        Applied here at add() rather than only in the extractor path so
+        explicit `remember` tool calls are subject to the same gate."""
+        safe, reason = _is_memory_content_safe(content)
+        if not safe:
+            # INFO level so the operator can see what was attempted but
+            # spammers (extractor-via-injection) don't get an LLM-visible
+            # error response that tells them what triggered the filter.
+            log.info(
+                "memory rejected in %s (%s): %r",
+                channel, reason, content[:120],
+            )
+            return None
+
         try:
             vec = await self.embed(content, purpose="embed_write", channel=channel)
         except (APIError, APIConnectionError) as e:
