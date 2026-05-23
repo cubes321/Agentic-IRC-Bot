@@ -52,6 +52,17 @@ breaking changes freely until a `1.0.0` release).
   connect). Mitigated only by keeping the window small. Documented in
   `bot/url_safety.py` module docstring.
 
+- **[SEC L3]** Redact DM content in INFO-level logs. The `on_message`
+  and `on_ctcp_action` engagement paths previously logged the user's
+  message text at INFO (e.g. `Engaging in #foo for alice: 'pizza?'`)
+  including for DMs — even though DMs are deliberately excluded from
+  the SQLite `message_log` table for exactly the same privacy reason.
+  Operator sharing a log file for debugging would inadvertently leak
+  private user messages. Now: for DMs, the INFO line says
+  `<DM redacted>` and the full content is logged at DEBUG only (so
+  deliberate `-v` runs can still see it). Channel messages are
+  unchanged — those are already public. Closes review finding L3.
+
 - **[SEC H4]** TLS on by default; TLS verification no longer
   force-disabled. The pre-2026-05 config defaults were `port = 6667,
   tls = false` (plaintext IRC), and `bot/main.py` hardcoded

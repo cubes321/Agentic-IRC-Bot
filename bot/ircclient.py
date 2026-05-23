@@ -316,7 +316,17 @@ class IRCBot(pydle.Client):
         if not trigger:
             trigger = message
 
-        log.info("Engaging in %s for %s: %r", reply_target, source, trigger[:120])
+        # Privacy: for DMs, redact the trigger content at INFO. DMs are
+        # excluded from message_log for exactly the same reason — channel
+        # operators (or anyone with the log file) should not be able to
+        # read private user messages from a routine INFO-level boot log.
+        # The DEBUG path still gets full content for deliberate debugging.
+        # (Security review L3, 2026-05-22.)
+        if is_dm:
+            log.info("Engaging in %s for %s: <DM redacted>", reply_target, source)
+            log.debug("DM trigger from %s: %r", source, trigger[:120])
+        else:
+            log.info("Engaging in %s for %s: %r", reply_target, source, trigger[:120])
 
         # Run the agent in a background task so a slow LLM call does not block
         # other events (other channels' messages, joins, etc.). Register it in
@@ -395,7 +405,13 @@ class IRCBot(pydle.Client):
         # prefix tells the LLM this was an action so it can respond in kind.
         trigger = formatted
 
-        log.info("Engaging in %s for %s (action): %r", reply_target, by, contents[:120])
+        # Same privacy redaction as the on_message path: DM actions are
+        # private and should not be echoed to INFO logs verbatim. (L3.)
+        if is_dm:
+            log.info("Engaging in %s for %s (action): <DM redacted>", reply_target, by)
+            log.debug("DM action from %s: %r", by, contents[:120])
+        else:
+            log.info("Engaging in %s for %s (action): %r", reply_target, by, contents[:120])
 
         task = asyncio.create_task(
             self._handle_engagement(reply_target, by, account, trigger, policy),
