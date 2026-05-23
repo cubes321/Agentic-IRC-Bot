@@ -7,9 +7,11 @@ these tools degrade with a clear error.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 
 from . import Tool, ToolContext, register
 from ..db import now_utc_iso
@@ -227,19 +229,101 @@ def _parse_when(spec: str) -> datetime | None:
 
 
 def _td(seconds: int):
-    from datetime import timedelta
     return timedelta(seconds=seconds)
+
+
+# Per-actor rate limit on set_reminder calls (security review H3).
+# In-memory, resets on restart — same pattern as private_msg's _dm_history.
+# The trade-off: a determined attacker can spam through a restart, but the
+# DB-backed alternative would require a schema change and a query per
+# write. For a hobby bot the in-memory state lasts long enough to be
+# effective. Adding owner_account to the reminder payload (further below)
+# unblocks a future DB-backed enforcement upgrade if needed.
+_REMINDER_RATE_LIMIT = 5            # max creations per actor per window
+_REMINDER_RATE_WINDOW_SEC = 3600.0  # 1 hour
+_REMINDER_MAX_HORIZON_SEC = 90 * 86400  # 90 days — cap on `when`
+
+_reminder_history: dict[str, list[float]] = {}
+_reminder_history_lock = asyncio.Lock()
+
+
+async def _check_reminder_rate(actor_key: str) -> tuple[bool, int]:
+    """Returns (allowed, remaining_in_window). actor_key should be the
+    requester's account (preferred) or `nick:<lowernick>` as fallback
+    so account and nick namespaces can't collide."""
+    async with _reminder_history_lock:
+        now = time.monotonic()
+        window_start = now - _REMINDER_RATE_WINDOW_SEC
+        hist = _reminder_history.get(actor_key, [])
+        fresh = [t for t in hist if t >= window_start]
+        if len(fresh) >= _REMINDER_RATE_LIMIT:
+            _reminder_history[actor_key] = fresh  # preserve pruned state
+            return False, 0
+        fresh.append(now)
+        _reminder_history[actor_key] = fresh
+        return True, _REMINDER_RATE_LIMIT - len(fresh)
 
 
 async def _set_reminder(ctx: ToolContext, args: dict) -> dict:
     when = _parse_when(args.get("when", ""))
     if when is None:
         return {"error": "could not parse 'when' (try ISO timestamp or e.g. '15m', '2h', '1d')"}
+
+    # Horizon and past-time bounds. Without these, the LLM (under prompt
+    # injection or aggressive user request) could set reminders for
+    # year-2099 timestamps that survive across many restarts, or pass
+    # an ISO date in the past which would fire immediately. Both are
+    # abuse vectors. (Security review H3.)
+    now_dt = datetime.now(timezone.utc)
+    if when > now_dt + timedelta(seconds=_REMINDER_MAX_HORIZON_SEC):
+        return {
+            "error": (
+                f"reminder too far in the future: {when.isoformat()} "
+                f"(max {_REMINDER_MAX_HORIZON_SEC // 86400} days from now). "
+                "Pick a sooner time."
+            ),
+        }
+    # Allow a 60-second slack for clock skew; anything older is real-past.
+    if when < now_dt - timedelta(minutes=1):
+        return {
+            "error": (
+                f"reminder fire_at is in the past: {when.isoformat()}. "
+                "Pick a future time."
+            ),
+        }
+
     target_nick = args.get("target_nick") or ctx.actor_nick
     message = (args.get("message") or "").strip()
     if not message:
         return {"error": "message is empty"}
-    payload = json.dumps({"target_nick": target_nick, "message": message})
+
+    # Per-actor rate limit. Prefer account (stable across nick changes),
+    # fall back to nick prefixed with 'nick:' so the namespaces don't
+    # collide (account "alice" vs nick "alice" must hash separately).
+    actor_key = (
+        ctx.actor_account if ctx.actor_account
+        else f"nick:{(ctx.actor_nick or '').lower()}"
+    )
+    allowed, remaining = await _check_reminder_rate(actor_key)
+    if not allowed:
+        log.info("set_reminder rate-limited for %s", actor_key)
+        return {
+            "error": (
+                f"reminder rate limit: you've set {_REMINDER_RATE_LIMIT} "
+                f"reminders in the last hour. Try again later."
+            ),
+        }
+
+    # Payload carries the owner so the scheduler can log who set what at
+    # fire time, and so a future audit / cancellation feature can scope
+    # to "reminders set by X." Older rows lack these fields; the fire
+    # loop reads with .get() so backward-compatible.
+    payload = json.dumps({
+        "target_nick": target_nick,
+        "message": message,
+        "owner_account": ctx.actor_account,
+        "owner_nick": ctx.actor_nick,
+    })
     new_id = await ctx.db.insert_returning_id(
         "INSERT INTO reminders (channel, fire_at, payload) VALUES (?, ?, ?)",
         (ctx.channel, when.isoformat(), payload),
@@ -249,6 +333,7 @@ async def _set_reminder(ctx: ToolContext, args: dict) -> dict:
         "id": new_id,
         "fire_at": when.isoformat(),
         "target_nick": target_nick,
+        "rate_remaining": remaining,
     }
 
 

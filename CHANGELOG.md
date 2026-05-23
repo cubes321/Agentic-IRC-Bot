@@ -52,6 +52,57 @@ breaking changes freely until a `1.0.0` release).
   connect). Mitigated only by keeping the window small. Documented in
   `bot/url_safety.py` module docstring.
 
+- **[SEC H3]** Reminder spam defences across the lifecycle. Previously
+  `set_reminder` had no rate limit, no horizon cap, no past-time check,
+  no per-channel fire cap, and no retention — letting one LLM turn write
+  many reminders that collectively flooded a channel, sometimes hours
+  later, and that lingered in the table forever for parted channels.
+  Classified as HIGH in the 2026-05-22 review.
+
+  Four mitigations, all bounded by hardcoded constants (no new config):
+
+  - **Write-time rate limit** (`bot/tools/memory_tools.py`): per-actor,
+    5 creations per hour, in-memory state. Keyed by account if
+    available, falling back to `nick:<lowernick>` so the account/nick
+    namespaces don't collide. Same pattern as `private_msg`'s
+    `_dm_history`. Refusal doesn't write to the reminders table.
+
+  - **Horizon cap** (90 days): rejects `when` values further in the
+    future. Defends against year-2099 reminders that survive across
+    many restarts.
+
+  - **Past-time check** (60s slack for clock skew): rejects `when`
+    values in the past. Defends against ISO timestamps before now
+    that would fire immediately and bypass any future ordering.
+
+  - **Per-channel fire-time cap** (`bot/scheduler.py:_fire_channel_batch`):
+    at most 5 reminders fire per channel per poll cycle (default 10s).
+    Excess get dropped with a single "(reminder flood control: N
+    additional reminders dropped...)" notice posted to the channel and
+    a WARNING log line for the operator. Drop-with-notice, not
+    delay-to-next-cycle — a 30-reminder backlog should not turn into a
+    1-minute sustained 5/10s flood.
+
+  - **Retention prune**: every hour, deletes reminders whose `fire_at`
+    is older than 7 days. Catches orphans (parted channels), rows that
+    repeatedly failed to fire (the per-row delete only runs on success),
+    and any ancient cruft. Runs inline from `_reminder_loop` rather
+    than as a separate coroutine — one DELETE/hour doesn't need its
+    own lifecycle.
+
+  Side effect: reminder payloads now carry `owner_account` and
+  `owner_nick` (in addition to `target_nick` and `message`). Older
+  payloads lack these fields; the fire loop reads via `.get()` so
+  backward-compatible. Unlocks a future audit / per-owner cancellation
+  feature without a schema migration.
+
+  Verified with a 7-case smoke test covering horizon cap, past-time
+  rejection, normal write, rate-limit overflow at the 6th call,
+  account-vs-nick namespace separation, over-cap fire grouping
+  (5 fire + 1 notice + 3 deletes), and under-cap pass-through.
+
+  Closes review finding H3.
+
 - **[SEC M1]** `private_msg` now requires the actor and target to share
   a channel. Pre-2026-05, once a channel had `allow_actions = ["msg"]`,
   the LLM could DM any nick on the network — the per-target rate limit

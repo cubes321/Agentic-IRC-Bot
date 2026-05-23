@@ -29,7 +29,7 @@ import json
 import logging
 import random
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from openai import AsyncOpenAI, APIError, APIConnectionError
@@ -351,13 +351,39 @@ class Scheduler:
 
     # ---- reminder firing ----
 
+    # Per-channel cap on how many reminders may fire in a single poll cycle.
+    # Excess get dropped (with a one-line notice posted to the channel) to
+    # prevent the case where many reminders set across a long horizon all
+    # come due in the same 10-second window and flood. Drop-with-notice
+    # rather than delay-to-next-cycle: a 30-reminder backlog deferred 5 per
+    # cycle is just a 1-minute sustained flood. (Security review H3.)
+    MAX_REMINDERS_PER_CHANNEL_PER_CYCLE = 5
+    # Retention: delete reminders that should have fired more than this many
+    # days ago. Catches orphans (channels we've parted) and rows that
+    # repeatedly failed to fire. Bounded table size as a side effect.
+    REMINDER_RETENTION_DAYS = 7
+    # Periodic prune interval; runs from inside the reminder poll loop so
+    # we don't spawn a second long-lived coroutine for one DELETE per hour.
+    REMINDER_PRUNE_INTERVAL_SEC = 3600.0
+
     async def _reminder_loop(self) -> None:
         """Every reminder_poll_sec, look up due reminders and post them. Uses
         the same chat semaphore for any LLM-driven framing — but for v1, we
         post the reminder text verbatim, no LLM involvement, so the loop is
-        fast and cheap."""
+        fast and cheap.
+
+        Two H3 mitigations live inline here:
+          1. Per-channel fire-time cap (MAX_REMINDERS_PER_CHANNEL_PER_CYCLE):
+             groups due rows by channel; if more than N for one channel,
+             fires the first N and drops the rest with a single warning
+             line. Bounds the worst-case flood per channel per cycle.
+          2. Retention prune: every REMINDER_PRUNE_INTERVAL_SEC, deletes
+             rows whose fire_at is older than REMINDER_RETENTION_DAYS.
+             Catches orphans and failed-fire rows that the per-row delete
+             missed."""
         poll_sec = max(2, int(self.cfg.scheduler.reminder_poll_sec))
         log.info("Reminder loop: polling every %ds", poll_sec)
+        last_prune = 0.0  # monotonic; 0 means "prune on first cycle"
         try:
             while not self._stopping.is_set():
                 try:
@@ -366,8 +392,19 @@ class Scheduler:
                     log.exception("reminder poll failed")
                     rows = []
 
+                # Group due rows by channel so the per-channel cap applies.
+                by_channel: dict[str, list[Any]] = {}
                 for row in rows:
-                    await self._fire_reminder(row)
+                    by_channel.setdefault(row["channel"], []).append(row)
+                for channel, ch_rows in by_channel.items():
+                    await self._fire_channel_batch(channel, ch_rows)
+
+                # Periodic retention prune (orphans + failed-fire cleanup).
+                # Runs in-loop rather than as its own coroutine — one DELETE
+                # per hour doesn't need a dedicated lifecycle.
+                if time.monotonic() - last_prune > self.REMINDER_PRUNE_INTERVAL_SEC:
+                    await self._prune_old_reminders()
+                    last_prune = time.monotonic()
 
                 # Sleep but wake early if stop is signalled.
                 try:
@@ -377,6 +414,64 @@ class Scheduler:
         except asyncio.CancelledError:
             log.debug("reminder loop cancelled")
             raise
+
+    async def _fire_channel_batch(self, channel: str, rows: list[Any]) -> None:
+        """Fire up to MAX_REMINDERS_PER_CHANNEL_PER_CYCLE reminders for one
+        channel in this cycle; drop the excess with a notice."""
+        cap = self.MAX_REMINDERS_PER_CHANNEL_PER_CYCLE
+        if len(rows) <= cap:
+            for row in rows:
+                await self._fire_reminder(row)
+            return
+        # Over cap: fire first N, drop the rest.
+        for row in rows[:cap]:
+            await self._fire_reminder(row)
+        excess = rows[cap:]
+        log.warning(
+            "reminder fire-cap hit for %s: %d fired, %d dropped",
+            channel, cap, len(excess),
+        )
+        try:
+            await self.bot.irc_send(
+                channel,
+                f"(reminder flood control: {len(excess)} additional "
+                f"reminder(s) dropped to avoid spamming the channel)",
+            )
+        except Exception:
+            log.exception("failed to post fire-cap notice to %s", channel)
+        # Delete the dropped rows so they don't re-trigger next cycle.
+        for row in excess:
+            try:
+                await self.db.delete_reminder(row["id"])
+            except Exception:
+                log.exception(
+                    "fire-cap excess delete failed for reminder #%d", row["id"],
+                )
+
+    async def _prune_old_reminders(self) -> None:
+        """Delete reminders whose fire_at is older than REMINDER_RETENTION_DAYS.
+        Catches orphans (parted channels), reminders that repeatedly failed
+        to post (the per-row delete in _fire_reminder only runs on success),
+        and ancient rows from before retention was implemented."""
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            days=self.REMINDER_RETENTION_DAYS,
+        )
+        try:
+            # Direct sqlite execution so we can read cur.rowcount; the
+            # db.execute wrapper doesn't expose it.
+            async with self.db.conn.execute(
+                "DELETE FROM reminders WHERE fire_at < ?",
+                (cutoff.isoformat(),),
+            ) as cur:
+                deleted = cur.rowcount
+            await self.db.conn.commit()
+            if deleted > 0:
+                log.info(
+                    "Pruned %d expired reminder(s) older than %d days",
+                    deleted, self.REMINDER_RETENTION_DAYS,
+                )
+        except Exception:
+            log.exception("reminder retention prune failed")
 
     async def _fire_reminder(self, row: Any) -> None:
         """Post a single reminder and delete it. On failure, leave the row
