@@ -108,6 +108,46 @@ def _strip_text_tool_calls(text: str) -> str:
     return cleaned.strip()
 
 
+# ---- Per-turn caps on Tier-5 (IRC-action) tool calls. -----------------------
+#
+# Security review H1, 2026-05-22: a successful prompt injection from
+# fetched content (web page returned by fetch_url, etc.) can direct the
+# LLM to spray Tier-5 actions in a single turn — bounded only by step
+# cap (6 for reply, 30 for task). Per-target rate limits help for
+# private_msg but don't help for set_topic / me_action.
+#
+# These caps bound the worst case PER TURN. The numbers reflect what's
+# legitimate vs. what's suspicious:
+#   - set_topic   : 1 — a single turn that changes the topic twice
+#                       almost always reflects confusion / injection
+#   - private_msg : 3 — a few DMs per turn is plausible (delivering
+#                       reminders to multiple people); spraying 30 is not
+#   - me_action   : 5 — actions are personality flourishes; a turn
+#                       doing 6+ is in flood territory regardless
+# Tools not in this dict have no per-turn cap (most info-retrieval tools
+# are naturally self-limiting via the step cap).
+_TIER5_PER_TURN_CAPS = {
+    "set_topic": 1,
+    "private_msg": 3,
+    "me_action": 5,
+}
+
+
+def _check_tier5_cap(name: str, tier5_used: dict[str, int]) -> tuple[bool, int, int]:
+    """Cap-check helper used inline in _run_loop. Returns
+    (allowed, count_after, cap). For tools not in _TIER5_PER_TURN_CAPS,
+    returns (True, 0, -1) — no cap applies. Mutates tier5_used in place
+    when the call is allowed (increments the per-tool counter)."""
+    cap = _TIER5_PER_TURN_CAPS.get(name)
+    if cap is None:
+        return True, 0, -1
+    used = tier5_used.get(name, 0)
+    if used >= cap:
+        return False, used, cap
+    tier5_used[name] = used + 1
+    return True, used + 1, cap
+
+
 def _format_recent(rows: list) -> str:
     if not rows:
         return "(no recent messages)"
@@ -360,6 +400,10 @@ class AgentCore:
         deadline = time.monotonic() + wall_sec
         tools_by_name = {t.name: t for t in tools}
         last_sig: tuple[str, str] | None = None
+        # Per-turn Tier-5 call counts. (Security review H1.) Reset every
+        # turn — a fresh reply or task starts with zero. See
+        # _TIER5_PER_TURN_CAPS for the per-tool budgets.
+        tier5_used: dict[str, int] = {}
 
         # Per-call HTTP timeout is decoupled from the per-turn wall budget:
         # the wall budget governs whether we *start* another step, but a single
@@ -480,15 +524,46 @@ class AgentCore:
                     continue
                 last_sig = sig
 
+                # Per-turn Tier-5 cap (security review H1). Refuses additional
+                # action-type tool calls once the per-turn budget is spent for
+                # this tool name. Bounds the blast radius of a successful
+                # prompt injection that tries to spray IRC actions in one turn.
+                allowed, used, cap = _check_tier5_cap(name, tier5_used)
+                if not allowed:
+                    log.warning(
+                        "agent: per-turn cap reached for %s (%d/%d); refusing call",
+                        name, used, cap,
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps({
+                            "error": (
+                                f"per-turn cap reached for {name}: {cap} call(s) "
+                                f"already used this turn. Finish the turn or use "
+                                f"a different approach."
+                            ),
+                        }),
+                    })
+                    continue
+
                 try:
                     result = await tool.call(ctx, args)
                 except Exception as e:
                     log.exception("tool %s raised", name)
                     result = {"error": f"tool raised: {e!r}"}
+                # Wrap tool-result content in an explicit delimiter so the
+                # system prompt has something to reference when it tells the
+                # model that tool results are DATA, not instructions
+                # (security review H1). Adds ~30 bytes per result; cheap.
+                # The 8000-char cap stays on the raw JSON portion — total
+                # message size is bounded as before, plus the wrapper.
+                raw_content = json.dumps(result, default=str)[:8000]
+                wrapped = f'<tool_result name="{name}">{raw_content}</tool_result>'
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": json.dumps(result, default=str)[:8000],
+                    "content": wrapped,
                 })
 
         return await self._summarise_and_bail(messages, ctx.channel)
