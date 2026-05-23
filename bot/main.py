@@ -191,12 +191,73 @@ def _build_capabilities(cfg: Config) -> set[str]:
     return caps
 
 
+def _warn_insecure_transport(cfg: Config) -> None:
+    """Surface explicit insecure-transport choices at startup.
+
+    The defaults in ServerCfg are TLS-on with cert verification, so the
+    only way to reach a warning here is by explicitly opting out in the
+    config. We can't *prevent* that (someone might genuinely need to
+    talk to a self-signed development IRCd), but we make sure the
+    operator sees a clear line in the boot log.
+
+    Three distinct warnings — the severity actually differs:
+      - tls=False + Q AUTH configured  : Q password sent in cleartext.
+                                         The bot's services credential is
+                                         the highest-value secret on the
+                                         wire. Logged as ERROR-but-not-fatal
+                                         because it's almost certainly
+                                         not what the operator intended.
+      - tls=False (no Q AUTH)          : public IRC chat is already
+                                         public; not a credential leak
+                                         but anyone on the path can
+                                         see and inject messages.
+                                         Logged as WARNING.
+      - tls=True + tls_verify=False    : TLS connection but the bot will
+                                         accept any cert presented.
+                                         Trivially MITM-able by anyone
+                                         who can route packets. WARNING.
+    """
+    log = logging.getLogger("bot.main")
+    has_q_password = bool(cfg.server.quakenet.q_account and cfg.server.quakenet.q_password_file)
+    if not cfg.server.tls:
+        if has_q_password:
+            log.error(
+                "INSECURE: tls=false AND Q AUTH is configured. The Q password "
+                "will be sent in cleartext to %s:%d on the next connect. "
+                "Set tls=true and port=6697 (the Quakenet TLS port) unless "
+                "you specifically need plaintext for a local test server.",
+                cfg.server.host, cfg.server.port,
+            )
+        else:
+            log.warning(
+                "tls=false: connection to %s:%d will be plaintext. No services "
+                "credential is configured so nothing high-value transits, but "
+                "channel chat (and any future credential) is visible to anyone "
+                "on the network path.",
+                cfg.server.host, cfg.server.port,
+            )
+    elif not cfg.server.tls_verify:
+        log.warning(
+            "tls_verify=false: TLS connection to %s:%d will accept ANY "
+            "certificate, including attacker-presented ones. Use only for "
+            "self-signed development servers. Production deployments should "
+            "set tls_verify=true (the default).",
+            cfg.server.host, cfg.server.port,
+        )
+
+
 async def run(cfg: Config, shutdown_event: asyncio.Event) -> None:
     log = logging.getLogger("bot.main")
 
     # Mark the session start time. Used to scope the "this session" portion
     # of the on-exit usage summary.
     session_started_iso = datetime.now(timezone.utc).isoformat()
+
+    # Surface any explicit insecure-transport choices BEFORE we touch the
+    # network. If the operator has tls=false + Q AUTH, they should see that
+    # ERROR line in the very first seconds of log output, not buried after
+    # the DB opens and the LM Studio probe runs.
+    _warn_insecure_transport(cfg)
 
     # Database
     db = Database(cfg.storage.db_path)
@@ -323,12 +384,21 @@ async def run(cfg: Config, shutdown_event: asyncio.Event) -> None:
         log.exception("task_runner startup_cleanup failed")
 
     try:
-        log.info("Connecting to %s:%d (tls=%s)", cfg.server.host, cfg.server.port, cfg.server.tls)
+        log.info(
+            "Connecting to %s:%d (tls=%s, tls_verify=%s)",
+            cfg.server.host, cfg.server.port,
+            cfg.server.tls, cfg.server.tls_verify,
+        )
+        # tls_verify previously hardcoded to False — fixed in security review
+        # H4 (2026-05-22). Now driven by cfg.server.tls_verify with a TLS-on,
+        # verify-on default. The _warn_insecure_transport() call earlier in
+        # run() ensures the operator sees a loud log line if either is
+        # turned off, so this code path is no longer silently insecure.
         await client.connect(
             hostname=cfg.server.host,
             port=cfg.server.port,
             tls=cfg.server.tls,
-            tls_verify=False,  # many IRCds use self-signed; revisit per-server
+            tls_verify=cfg.server.tls_verify,
         )
         # Start the scheduler now that we're connected and joining channels.
         # Even if not all joins land immediately, the tick coroutine for each

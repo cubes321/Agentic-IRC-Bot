@@ -4,8 +4,19 @@
 
 [server]
 host = "irc.quakenet.org"
-port = 6667
-tls = false
+# TLS on port 6697 is the default. Quakenet, Libera, OFTC, EFnet, IRCnet —
+# every mainstream network supports it. If you absolutely need to talk to a
+# plaintext server (a local test IRCd, an obscure private network), set
+# `tls = false` and `port = 6667` explicitly; the bot will warn at startup
+# (LOUDLY if you also have Q AUTH configured — that password would go in
+# cleartext).
+port = 6697
+tls = true
+# Verify the server's TLS certificate against the system trust store. Default
+# on. Disable ONLY if you're talking to a self-signed development server and
+# accept that the connection can be intercepted. The bot warns at startup
+# when this is off.
+tls_verify = true
 nick = "MyBot"
 realname = "Agentic IRC Bot"
 # Channels to JOIN at startup. The bot also auto-joins any channel that has a

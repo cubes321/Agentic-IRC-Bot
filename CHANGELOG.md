@@ -52,6 +52,45 @@ breaking changes freely until a `1.0.0` release).
   connect). Mitigated only by keeping the window small. Documented in
   `bot/url_safety.py` module docstring.
 
+- **[SEC H4]** TLS on by default; TLS verification no longer
+  force-disabled. The pre-2026-05 config defaults were `port = 6667,
+  tls = false` (plaintext IRC), and `bot/main.py` hardcoded
+  `tls_verify=False` regardless of config. Result: on Quakenet (and any
+  network where Q AUTH is the bot's services credential), the Q
+  password was sent in cleartext on every connect, and even a
+  hand-rolled TLS connection accepted any presented certificate.
+  Classified as HIGH in the 2026-05-22 security review.
+
+  Config changes (`bot/config.py:ServerCfg`):
+  - Default `port` is now `6697` (was `6667`).
+  - Default `tls` is now `true` (was `false`).
+  - New field `tls_verify: bool = True` controls system-trust-store
+    cert validation. Replaces the hardcoded `False` previously passed
+    to `client.connect(...)`.
+
+  Behaviour at startup (`bot/main.py`):
+  - `_warn_insecure_transport(cfg)` runs before any network activity.
+    Logs ERROR if `tls=false` AND Q AUTH is configured (cleartext
+    services password), WARNING if `tls=false` without Q AUTH (chat
+    visible to path), WARNING if `tls=true` but `tls_verify=false`
+    (cert-pinning disabled, MITM-trivial). Operators who knowingly run
+    plaintext for a local test server see one loud line and proceed.
+  - The connect log line now includes `tls_verify=` for visibility.
+
+  **Behaviour change for existing deployments:** if your `config.toml`
+  does NOT explicitly specify `[server].port` and `[server].tls`, the
+  next start will connect via TLS on 6697 instead of plaintext on 6667.
+  Quakenet supports both; the TLS port is recommended and is what other
+  modern clients default to. If your IRC server doesn't run TLS, add
+  `port = 6667` and `tls = false` to your `[server]` section — the bot
+  will warn at startup but still connect.
+
+  Verified manually: a config omitting `port`/`tls`/`tls_verify`
+  resolves to `(6697, True, True)`; a config with explicit
+  `port = 6667, tls = false` resolves to `(6667, False, True)` and
+  the bot logs the appropriate warning. No mid-session reconnect
+  behaviour was changed — only the values passed at initial connect.
+
 ### Added
 - Direct-message policy gate (`[dm]` config section). Channels are public
   but DMs are private and invisible to channel ops — without a gate,

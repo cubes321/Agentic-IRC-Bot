@@ -22,8 +22,21 @@ class QuakenetCfg(BaseModel):
 
 class ServerCfg(BaseModel):
     host: str
-    port: int = 6667
-    tls: bool = False
+    # TLS is the default since 2026-05 (security review H4). Quakenet, Libera,
+    # OFTC, EFnet, IRCnet and basically every network worth running a bot on
+    # offer TLS on 6697; the pre-2026 default of plaintext 6667 sent Q AUTH
+    # passwords in the clear. Operators who really need to talk to a plaintext
+    # server can still set `port = 6667, tls = false` explicitly — those
+    # values override these defaults. main() emits a WARNING when an explicit
+    # insecure setup is detected so the choice is at least loud.
+    port: int = 6697
+    tls: bool = True
+    # Verify the IRCd's TLS certificate against the system trust store. The
+    # pre-2026 code force-disabled this; result was that even a TLS
+    # connection could be intercepted by anyone who could present a
+    # certificate. Default ON; flip to false only if you specifically need
+    # to talk to a self-signed development server (and accept the MITM risk).
+    tls_verify: bool = True
     nick: str
     realname: str = "Agentic IRC Bot"
     channels: list[str] = Field(default_factory=list)
