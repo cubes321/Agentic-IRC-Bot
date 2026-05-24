@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -63,6 +64,24 @@ LIST_LIMIT = 10
 # mid-LLM-call; we set their cancel events and give the agent loops a
 # brief window to unwind cleanly before hard-cancelling the asyncio task.
 SHUTDOWN_TASK_GRACE_SEC = 10.0
+
+# Hard cap on how many WIRE LINES a task may post to the channel as its
+# final result. ircu-based IRCds (Quakenet, etc.) enforce excess-flood
+# limits via a fake-lag algorithm: each PRIVMSG adds ~2 + bytes/100
+# fake-lag seconds, and connections die when the accumulated debt
+# exceeds ~10 seconds. A verbose task answer of 30+ wire lines was
+# observed to trigger disconnect on Quakenet in production. Capping
+# the wire output, paired with a tighter TASK_SYSTEM prompt, keeps
+# even the most verbose model output safely under the flood threshold.
+# If a result exceeds the cap, the first N-1 wire lines are posted
+# and the Nth is a truncation notice; the full result remains in the
+# tasks.result DB row regardless. Tune this LOWER if the bot still
+# triggers flood on your IRC server; tune higher if your network is
+# more permissive.
+MAX_TASK_RESULT_WIRE_LINES = 10
+# Match ircclient.MAX_LINE_LEN — kept in sync by convention. If
+# someone changes the IRC line length cap, update both.
+_TASK_WRAP_WIDTH = 400
 
 
 @dataclass
@@ -400,15 +419,22 @@ class TaskRunner:
         result_text: str,
     ) -> None:
         """Post the task's outcome to the channel with a [task #N] prefix.
-        Each logical line of multi-line results gets the same prefix so IRC
-        clients render them as a coherent block.
 
-        Long logical lines (>400 chars; common for markdown bullets in task
-        results) are word-wrapped by `bot.irc_send`; each wrap-continuation
-        also carries the `[task #N]` prefix so every wire line stays
-        identifiable as part of the same task block. `max_lines=20` per
-        irc_send call gives generous headroom for one logical line to
-        wrap into many sub-lines without truncation.
+        Two-layer flood defence (verbose task answers were observed
+        triggering Quakenet excess-flood disconnects on results larger
+        than ~30 wire lines):
+
+          1. The TASK_SYSTEM prompt instructs the model to keep its
+             final answer terse and names flooding as the concrete
+             cost. Reduces output volume at the source.
+          2. THIS METHOD preflights the wire-line count and caps the
+             result at MAX_TASK_RESULT_WIRE_LINES total. If the result
+             would exceed the cap, the first (cap - 1) wire lines are
+             posted and the cap'th is a truncation notice. The full
+             result remains in the tasks.result DB row regardless
+             (persisted by _persist_outcome before this method runs),
+             so no information is permanently lost — only the
+             channel-visible portion is bounded.
 
         Failure modes (network drop, channel parted) are logged but not
         retried — the result is in the DB; the channel post is best-effort.
@@ -427,26 +453,62 @@ class TaskRunner:
             # 'new bullet' from 'wrapped continuation' at the prefix layer.
             cont_prefix = f"[task #{task_id}]   "
 
-            lines = [ln for ln in result_text.splitlines() if ln.strip()]
-            if not lines:
-                lines = [result_text or "(no result)"]
+            logical_lines = [ln for ln in result_text.splitlines() if ln.strip()]
+            if not logical_lines:
+                logical_lines = [result_text or "(no result)"]
 
-            # First logical line: prefix is the status-aware variant (e.g.
-            # `[task #5] cancelled: ` for cancelled tasks); wrap
-            # continuations of this line use the lighter `[task #5]   ` form.
-            await self.bot.irc_send(
-                channel, prefix + lines[0],
-                continuation_prefix=cont_prefix,
-                max_lines=20,
+            # Preflight: count how many wire lines this result would
+            # produce if posted in full. The wrap params here MUST match
+            # the ones in IRCBot.irc_send — if those change, change these.
+            # We use this count to decide whether to truncate.
+            total_wire_lines = 0
+            for i, ln in enumerate(logical_lines):
+                head = prefix if i == 0 else cont_prefix
+                chunks = textwrap.wrap(
+                    head + ln,
+                    width=_TASK_WRAP_WIDTH,
+                    subsequent_indent=cont_prefix,
+                    break_long_words=True,
+                    break_on_hyphens=False,
+                )
+                total_wire_lines += max(1, len(chunks))
+
+            needs_truncation = total_wire_lines > MAX_TASK_RESULT_WIRE_LINES
+            # Reserve one wire-line slot for the truncation notice if we
+            # need it; otherwise the entire cap is available for content.
+            content_budget = (
+                MAX_TASK_RESULT_WIRE_LINES - 1
+                if needs_truncation
+                else MAX_TASK_RESULT_WIRE_LINES
             )
-            # Subsequent logical lines: use the lighter prefix for the
-            # first chunk too — they are by definition continuations of
-            # the task-result block.
-            for ln in lines[1:]:
-                await self.bot.irc_send(
-                    channel, cont_prefix + ln,
+
+            if needs_truncation:
+                log.info(
+                    "task #%d result would be %d wire lines; capping at %d "
+                    "to avoid IRC excess-flood",
+                    task_id, total_wire_lines, MAX_TASK_RESULT_WIRE_LINES,
+                )
+
+            # Send up to content_budget wire lines, walking the logical
+            # lines in order. Each irc_send returns its actual sent count;
+            # we deduct from the remaining budget and bail when it's gone.
+            for i, ln in enumerate(logical_lines):
+                if content_budget <= 0:
+                    break
+                head = prefix if i == 0 else cont_prefix
+                sent = await self.bot.irc_send(
+                    channel, head + ln,
                     continuation_prefix=cont_prefix,
-                    max_lines=20,
+                    max_lines=content_budget,
+                )
+                content_budget -= sent
+
+            if needs_truncation:
+                await self.bot.irc_send(
+                    channel,
+                    f"[task #{task_id}] (output truncated to "
+                    f"{MAX_TASK_RESULT_WIRE_LINES} lines to avoid IRC "
+                    "excess-flood; full result stored in the tasks DB row)",
                 )
         except Exception:
             log.exception(

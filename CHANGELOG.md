@@ -9,6 +9,30 @@ breaking changes freely until a `1.0.0` release).
 
 ## [Unreleased]
 
+### Fixed
+- Task results no longer flood the channel hard enough to trigger
+  IRC excess-flood disconnects. A verbose multi-paragraph task answer
+  (30+ wire lines after wrap) was observed killing the bot's
+  connection on Quakenet. Two-layer fix:
+  - `TASK_SYSTEM` prompt now explicitly tells the model to keep the
+    final answer to 2-4 short paragraphs / ~1200 chars, names excess-
+    flood disconnection as the concrete cost, and discourages heavy
+    markdown structure (which wraps to many wire lines).
+  - `tasks._post_result` now preflights the wire-line count via
+    `textwrap.wrap` (matching `irc_send`'s wrap config) and caps the
+    posted result at `MAX_TASK_RESULT_WIRE_LINES = 10` lines total.
+    If the result would exceed the cap, the first 9 wire lines are
+    posted and the 10th is `(output truncated... full result stored
+    in the tasks DB row)`. The full result remains in the
+    `tasks.result` DB row (persisted before this method runs), so
+    nothing is permanently lost — only the channel-visible portion
+    is bounded.
+  - `IRCBot.irc_send` now returns the count of wire lines actually
+    sent (was `None`). Needed so `_post_result` can track a budget
+    across multiple `irc_send` calls. Backward-compatible: all
+    existing callers ignore the return value, so returning `int`
+    instead of `None` is invisible to them.
+
 ### Security
 - **[SEC C1]** SSRF mitigation. `fetch_url`, `look_at_image`, and
   `youtube_info` previously accepted any HTTP(S) URL with no host

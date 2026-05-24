@@ -752,8 +752,14 @@ class IRCBot(pydle.Client):
         *,
         continuation_prefix: str = "",
         max_lines: int | None = None,
-    ) -> None:
+    ) -> int:
         """Send `text` to `target` as one or more PRIVMSGs.
+
+        Returns the count of wire lines actually sent. Callers (notably
+        `tasks._post_result`) use this to accumulate a budget across
+        multiple calls so the bot doesn't get killed for excess flood
+        on a verbose multi-paragraph task answer. Returning 0 is normal
+        for empty / whitespace-only input.
 
         Behaviour:
         - Splits `text` on newlines; empty / whitespace-only lines are dropped.
@@ -776,10 +782,11 @@ class IRCBot(pydle.Client):
         call aborts the rest of the send for this invocation and is
         logged. The remaining text is dropped (acceptable; the caller
         usually has the full text stored elsewhere — DB row for tasks,
-        log_message row for replies).
+        log_message row for replies). Returns the count sent up to
+        the failure.
         """
         if not text:
-            return
+            return 0
         cap = MAX_LINES_PER_REPLY if max_lines is None else max_lines
         sent = 0
         for raw in text.splitlines():
@@ -820,6 +827,7 @@ class IRCBot(pydle.Client):
                     await self.message(target, chunk)
                 except Exception:
                     log.exception("failed to send line to %s", target)
-                    return
+                    return sent
                 sent += 1
                 await asyncio.sleep(INTER_LINE_DELAY)
+        return sent
