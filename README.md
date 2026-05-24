@@ -15,6 +15,11 @@ before disconnecting.
 Designed for use with **LM Studio** (or any OpenAI-compatible endpoint),
 with first-class support for **Quakenet** authentication.
 
+See [`CHANGELOG.md`](CHANGELOG.md) for the slice-by-slice history of what
+shipped, and [`ROADMAP.md`](ROADMAP.md) for V2 ideas that are deliberately
+out of scope for v1 (richer personas, chat sommelier, pastebin upload for
+long task results, image generation, etc.).
+
 ## What it does
 
 **Engagement**
