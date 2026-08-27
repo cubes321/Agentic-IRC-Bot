@@ -57,6 +57,13 @@ TELL_SWEEP_INTERVAL_SEC = 3600.0
 TELL_MAX_PENDING_PER_PAIR = 5        # from one sender to one recipient
 TELL_MAX_PENDING_PER_RECIPIENT = 15  # at one recipient, all senders combined
 
+# How many tells the bot will hand over in one arrival. More than this and
+# the rest wait for the recipient's next activity. IRC servers kill clients
+# that flood: ircu-based networks (Quakenet) accumulate fake-lag per
+# PRIVMSG and disconnect past ~10 seconds of debt — the same failure the
+# task-result wire cap exists to prevent.
+TELL_MAX_DELIVER_PER_ARRIVAL = 3
+
 # RFC 2812 nick shape: a letter or one of the "special" characters first,
 # then letters, digits, specials, or '-'. Without this check,
 # `!tell hi there everyone` silently files a tell for a user named "hi".
@@ -79,6 +86,25 @@ def actor_key(nick: str, account: str | None) -> str:
     if account:
         return account
     return f"nick:{(nick or '').lower()}"
+
+
+def human_age(created_iso: str) -> str:
+    """'3h ago' / '2d ago' — a rough age for the delivered line. Precision
+    beyond this is noise; the point is 'is this stale or fresh'."""
+    try:
+        created = datetime.fromisoformat(created_iso)
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return "a while ago"
+    secs = int((datetime.now(timezone.utc) - created).total_seconds())
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
 
 
 @dataclass
@@ -275,10 +301,16 @@ class TellStore:
         the tell was left. The second arm is what catches `dave` coming
         back as `dave_`.
 
-        The `to_account IS NOT NULL` guard is load-bearing. Without it, an
-        arriving user with no account (account = None) would match every
-        tell whose to_account is also NULL — i.e. the first person to speak
-        would collect everyone's messages."""
+        The `to_account IS NOT NULL` guard is defence-in-depth, not
+        load-bearing today: SQL's three-valued logic already makes
+        `to_account = ?` yield NULL (not true) whenever either side is
+        NULL, so an accountless arrival cannot collect NULL-account tells
+        even without it. It is kept because that protection is a property
+        of the comparison operator rather than of this code — an edit that
+        switched to `IS`, or moved the match into Python where
+        `None == None` is True, would silently turn this into a
+        cross-user message leak. The guard makes the requirement explicit
+        at the site that depends on it."""
         return await self.db.fetchall(
             "SELECT * FROM tells "
             "WHERE channel = ? AND delivered_at IS NULL AND expires_at > ? "
@@ -287,6 +319,80 @@ class TellStore:
             "ORDER BY created_at ASC, id ASC",
             (channel, now_utc_iso(), (nick or "").lower(), account, account),
         )
+
+    async def deliver(
+        self, bot: Any, channel: str, nick: str, account: str | None
+    ) -> int:
+        """Hand over any tells waiting for this person. Returns the count
+        delivered.
+
+        The lock covers the whole read-post-mark sequence. A JOIN and the
+        recipient's first message can arrive milliseconds apart and both
+        call this; without the lock they would each read the same pending
+        rows and post them twice.
+
+        delivered_at is set AFTER a successful send, never before. A wire
+        failure therefore leaves the row pending and it retries on their
+        next activity — the same choice _fire_reminder makes. A duplicated
+        tell is annoying; a silently lost one defeats the feature."""
+        async with self._deliver_lock:
+            rows = await self.pending_for(channel, nick, account)
+            if not rows:
+                return 0
+
+            batch = rows[:TELL_MAX_DELIVER_PER_ARRIVAL]
+            overflow = len(rows) - len(batch)
+            delivered = 0
+
+            for row in batch:
+                line = (
+                    f"{nick}: [from {row['from_nick']}, "
+                    f"{human_age(row['created_at'])}] {row['message']}"
+                )
+                try:
+                    await bot.irc_send(channel, line)
+                except Exception:
+                    log.exception(
+                        "tell #%s: send failed, leaving pending", row["id"]
+                    )
+                    break
+                try:
+                    await self.db.execute(
+                        "UPDATE tells SET delivered_at = ? WHERE id = ?",
+                        (now_utc_iso(), row["id"]),
+                    )
+                except Exception:
+                    # Sent but not marked: it will be delivered again on
+                    # their next activity. Logged loudly because a repeat
+                    # is confusing to users and worth noticing.
+                    log.exception(
+                        "tell #%s: posted but failed to mark delivered",
+                        row["id"],
+                    )
+                    continue
+                delivered += 1
+                await self.db.log_audit(
+                    action="tell.deliver",
+                    channel=channel,
+                    actor_nick=row["from_nick"],
+                    actor_account=row["from_account"],
+                    details={"tell_id": row["id"], "to_nick": nick},
+                )
+
+            if delivered and overflow:
+                try:
+                    await bot.irc_send(
+                        channel,
+                        f"{nick}: (+{overflow} more, next time you're around)",
+                    )
+                except Exception:
+                    log.exception("tell overflow notice failed for %s", nick)
+
+            if delivered:
+                log.info(
+                    "Delivered %d tell(s) to %s in %s", delivered, nick, channel
+                )
+            return delivered
 
     @staticmethod
     def _clean_target_nick(raw: str) -> str | None:

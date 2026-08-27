@@ -309,7 +309,11 @@ async def test_pending_for_ignores_unrelated_people(store):
 
 async def test_pending_for_does_not_match_null_account(store):
     # A tell with to_account NULL must not match everyone who arrives
-    # without an account. Guards a NULL-comparison mistake in the WHERE.
+    # without an account.
+    # Pins the no-cross-user-leak behaviour itself. (Note: this passes with
+    # or without the explicit IS NOT NULL guard in the WHERE — SQL's
+    # `= NULL` is already never true. It pins the outcome that matters,
+    # not the guard's presence.)
     await _leave(store, to="dave")
     assert await store.pending_for("#test", "erin", None) == []
 
@@ -342,3 +346,107 @@ async def test_pending_for_is_oldest_first(store):
         )
     rows = await store.pending_for("#test", "dave", None)
     assert [r["message"] for r in rows] == ["msg0", "msg1", "msg2"]
+
+
+import asyncio
+
+from bot.tells import TELL_MAX_DELIVER_PER_ARRIVAL, human_age
+
+
+class FakeBot:
+    """Stand-in for IRCBot. Records what would go on the wire. Only
+    irc_send is needed — TellStore never touches anything else."""
+
+    def __init__(self, fail: bool = False):
+        self.sent: list[tuple[str, str]] = []
+        self.fail = fail
+
+    async def irc_send(self, target: str, text: str, **kwargs) -> int:
+        if self.fail:
+            raise RuntimeError("wire is down")
+        self.sent.append((target, text))
+        return 1
+
+
+def test_human_age_formats():
+    assert human_age(now_utc_iso()) == "just now"
+    assert human_age("2020-01-01T00:00:00+00:00").endswith("d ago")
+    assert human_age("not a timestamp") == "a while ago"
+
+
+async def test_deliver_posts_and_marks(store):
+    await _leave(store, to="dave")
+    bot = FakeBot()
+    n = await store.deliver(bot, "#test", "dave", None)
+    assert n == 1
+    assert len(bot.sent) == 1
+    target, text = bot.sent[0]
+    assert target == "#test"
+    assert text.startswith("dave:")
+    assert "alice" in text
+    row = await store.db.fetchone("SELECT delivered_at FROM tells")
+    assert row["delivered_at"] is not None
+
+
+async def test_deliver_is_not_repeated(store):
+    await _leave(store, to="dave")
+    bot = FakeBot()
+    assert await store.deliver(bot, "#test", "dave", None) == 1
+    assert await store.deliver(bot, "#test", "dave", None) == 0
+    assert len(bot.sent) == 1
+
+
+async def test_deliver_noop_when_nothing_pending(store):
+    bot = FakeBot()
+    assert await store.deliver(bot, "#test", "nobody", None) == 0
+    assert bot.sent == []
+
+
+async def test_deliver_caps_per_arrival_and_flags_the_rest(store):
+    for i in range(TELL_MAX_DELIVER_PER_ARRIVAL + 2):
+        await store.create(
+            channel="#test", from_nick=f"s{i}", from_account=None,
+            to_nick="dave", to_account=None, message=f"m{i}",
+            bot_nick="TestBot",
+        )
+    bot = FakeBot()
+    n = await store.deliver(bot, "#test", "dave", None)
+    assert n == TELL_MAX_DELIVER_PER_ARRIVAL
+    # 3 tells + 1 overflow notice
+    assert len(bot.sent) == TELL_MAX_DELIVER_PER_ARRIVAL + 1
+    assert "2 more" in bot.sent[-1][1]
+
+
+async def test_deliver_delivers_the_remainder_next_time(store):
+    for i in range(TELL_MAX_DELIVER_PER_ARRIVAL + 2):
+        await store.create(
+            channel="#test", from_nick=f"s{i}", from_account=None,
+            to_nick="dave", to_account=None, message=f"m{i}",
+            bot_nick="TestBot",
+        )
+    bot = FakeBot()
+    await store.deliver(bot, "#test", "dave", None)
+    assert await store.deliver(bot, "#test", "dave", None) == 2
+
+
+async def test_deliver_leaves_row_pending_when_send_fails(store):
+    await _leave(store, to="dave")
+    n = await store.deliver(FakeBot(fail=True), "#test", "dave", None)
+    assert n == 0
+    row = await store.db.fetchone("SELECT delivered_at FROM tells")
+    assert row["delivered_at"] is None, "a failed send must not mark delivered"
+    # And it still arrives on the next attempt.
+    bot = FakeBot()
+    assert await store.deliver(bot, "#test", "dave", None) == 1
+
+
+async def test_concurrent_deliver_does_not_double_post(store):
+    """The join-and-speak race: both hooks fire within milliseconds."""
+    await _leave(store, to="dave")
+    bot = FakeBot()
+    results = await asyncio.gather(
+        store.deliver(bot, "#test", "dave", None),
+        store.deliver(bot, "#test", "dave", None),
+    )
+    assert sorted(results) == [0, 1]
+    assert len(bot.sent) == 1
