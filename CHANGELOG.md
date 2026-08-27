@@ -21,8 +21,8 @@ breaking changes freely until a `1.0.0` release).
     left for `dave` still reaches him when he returns as `dave_`.
   - `!tells` lists the tells you have pending in the channel; `!untell
     <id>` withdraws one before it is delivered (operators may withdraw
-    any). A `leave_message` tool gives the LLM the same path, so "tell
-    dave I said hi when he's back" works conversationally.
+    any in the channel). A `leave_message` tool gives the LLM the same
+    path, so "tell dave I said hi when he's back" works conversationally.
   - Tells are **not private** — the whole channel sees them on delivery.
     That is deliberate: it keeps the bot from becoming an unlogged
     whisper relay.
@@ -41,7 +41,7 @@ breaking changes freely until a `1.0.0` release).
   - Per-channel `allow_tell` (default on) gates *creation only* —
     switching it off cannot strand messages someone already left.
 - **First test suite** — `pytest` + `pytest-asyncio`, covering
-  `TellStore` against a temporary SQLite file (61 tests). `TellStore` is
+  `TellStore` against a temporary SQLite file (72 tests). `TellStore` is
   pure logic over the database with no IRC dependency, which is what
   makes it testable without a live pydle.
 

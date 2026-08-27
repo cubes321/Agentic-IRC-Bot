@@ -18,7 +18,7 @@ from .config import Config
 from .db import Database
 from .memory import MemoryWriter
 from .policy import ChannelPolicy
-from .tells import human_age
+from .tells import TellStore, human_age
 
 log = logging.getLogger(__name__)
 
@@ -719,7 +719,14 @@ class IRCBot(pydle.Client):
         # we fall back to nick matching. Deliberately no WHOIS here: the
         # target is usually offline, and WHOIS on an absent nick just
         # returns 401.
-        to_account = self.cached_account_or_none(to_nick)
+        #
+        # Resolve the account against the CLEANED nick, which is what
+        # create() will store. Looking up the raw token means "dave," misses
+        # the cache and files an account-less tell — one that won't follow
+        # the recipient to a new nick and won't count against their
+        # account-based cap.
+        cleaned_target = TellStore.clean_target_nick(to_nick) or to_nick
+        to_account = self.cached_account_or_none(cleaned_target)
 
         try:
             result = await self.tell_store.create(

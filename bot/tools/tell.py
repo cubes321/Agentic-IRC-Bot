@@ -9,7 +9,7 @@ place is what stops the command path and this path from drifting apart.
 from __future__ import annotations
 
 from . import Tool, ToolContext, register
-from ..tells import CHANNEL_PREFIXES
+from ..tells import CHANNEL_PREFIXES, TellStore
 
 
 async def _leave_message(ctx: ToolContext, args: dict) -> dict:
@@ -34,8 +34,13 @@ async def _leave_message(ctx: ToolContext, args: dict) -> dict:
     # the two entry points produce identical rows. Cache-only, never a
     # WHOIS: the target is usually offline and WHOIS on an absent nick just
     # returns 401. A miss is fine — the tell then matches on nick alone.
+    #
+    # Resolved against the CLEANED token, which is what create() will
+    # store — looking up the raw token misses the account cache and
+    # quietly files an account-less tell.
+    cleaned = TellStore.clean_target_nick(target) or target
     resolve = getattr(bot, "cached_account_or_none", None)
-    to_account = resolve(target) if callable(resolve) else None
+    to_account = resolve(cleaned) if callable(resolve) else None
 
     result = await store.create(
         channel=ctx.channel,

@@ -148,6 +148,16 @@ async def test_create_strips_trailing_punctuation(store: TellStore, raw: str):
     assert row["to_nick_lower"] == "dave"
 
 
+def test_clean_target_nick_is_shared():
+    # Pins clean_target_nick as public interface: bot/ircclient.py and
+    # bot/tools/tell.py both call it directly to resolve a target's account
+    # against the SAME cleaned token create() will store. A future rename
+    # back to a "private" name has to notice these two external callers.
+    assert TellStore.clean_target_nick("dave,") == "dave"
+    assert TellStore.clean_target_nick("#dave") == "dave"
+    assert TellStore.clean_target_nick("!!!") is None
+
+
 async def test_create_refuses_the_bot_itself(store: TellStore):
     r = await store.create(
         channel="#test", from_nick="alice", from_account=None,
@@ -656,3 +666,34 @@ async def test_prune_removes_old_delivered_and_expired(store):
     assert await store.prune() == 2
     rows = await store.db.fetchall("SELECT to_nick FROM tells")
     assert [r["to_nick"] for r in rows] == ["dave"]
+
+
+async def test_entry_points_produce_equivalent_rows(store):
+    """The spec's load-bearing claim is that !tell and leave_message cannot
+    drift apart. They have drifted twice already — once when the tool
+    skipped account resolution, once when only one caller cleaned the
+    target token before the cache lookup. Both are now expected to resolve
+    the SAME cleaned nick and hand create() the same arguments, so the rows
+    they produce must be indistinguishable apart from id and timestamp."""
+    raw = "dave,"                       # punctuated, as a human would type it
+    cleaned = TellStore.clean_target_nick(raw)
+    fake_cache = {"dave": "dave_acct"}  # what both callers would look up
+
+    common = dict(
+        channel="#test", from_nick="alice", from_account="alice_acct",
+        message="check the logs", bot_nick="TestBot",
+    )
+    # What _cmd_tell supplies, and what the leave_message tool supplies.
+    for _ in range(2):
+        await store.create(
+            to_nick=raw, to_account=fake_cache.get(cleaned), **common
+        )
+
+    rows = await store.db.fetchall("SELECT * FROM tells ORDER BY id")
+    assert len(rows) == 2
+    fields = ("channel", "from_nick", "from_account", "from_key",
+              "to_nick", "to_nick_lower", "to_account", "message")
+    assert {f: rows[0][f] for f in fields} == {f: rows[1][f] for f in fields}
+    # And the account actually got resolved — the whole point of the fix.
+    assert rows[0]["to_account"] == "dave_acct"
+    assert rows[0]["to_nick_lower"] == "dave"

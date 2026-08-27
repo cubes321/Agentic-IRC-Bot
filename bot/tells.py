@@ -68,7 +68,10 @@ TELL_MAX_DELIVER_PER_ARRIVAL = 3
 # enforces it rather than trusting the caller: an unbounded list handed to a
 # handler that posts one line per row is an excess-flood disconnect waiting
 # to happen (see the task-result cap in tasks.py for the same lesson).
-TELL_LIST_LIMIT = 10
+# Deliberately one more than MAX_TELL_LIST_WIRE_LINES in ircclient: the
+# extra row is what tells the handler there IS a remainder to flag. Fetching
+# more than that would be rows nobody can ever be shown.
+TELL_LIST_LIMIT = 9
 
 # RFC 2812 nick shape: a letter or one of the "special" characters first,
 # then letters, digits, specials, or '-'. Without this check,
@@ -175,7 +178,7 @@ class TellStore:
         if not self.cfg.channel(channel).allow_tell:
             return TellResult(False, "(tells are disabled in this channel)")
 
-        target = self._clean_target_nick(to_nick)
+        target = self.clean_target_nick(to_nick)
         if target is None:
             return TellResult(
                 False,
@@ -553,9 +556,14 @@ class TellStore:
             return 0
 
     @staticmethod
-    def _clean_target_nick(raw: str) -> str | None:
+    def clean_target_nick(raw: str) -> str | None:
         """Strip channel prefixes and whitespace, then validate the shape.
-        Returns None if what's left isn't a usable nick."""
+        Returns None if what's left isn't a usable nick.
+
+        Public because callers must resolve a target's account against the
+        SAME cleaned token this method will store — looking up the raw
+        token misses the account cache and quietly files an account-less
+        tell."""
         candidate = (raw or "").strip().lstrip(_CHANNEL_PREFIXES).strip()
         # People address each other as "dave," or "dave:" in chat, so those
         # arrive as part of the target token. Strip them rather than refusing
