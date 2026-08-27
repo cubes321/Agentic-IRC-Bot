@@ -487,10 +487,15 @@ TELL_EXPIRY_DAYS = 30
 # `!tell hi there everyone` silently files a tell for a user named "hi".
 NICK_RE = re.compile(r"^[A-Za-z\[\]\\`_^{|}][A-Za-z0-9\[\]\\`_^{|}\-]{0,31}$")
 
-# Channel name prefixes per RFC 2811. Stripped from a target nick before
+# Channel name prefixes per RFC 2811 — one definition, exported, because
+# two places need it and a narrower second copy is a bug waiting to happen:
+# a `+`- or `!`-prefixed channel misread as a DM would refuse a legitimate
+# tell. `bot/tools/tell.py` imports this for its is-this-a-channel check.
+CHANNEL_PREFIXES = "#&+!"
+# The lstrip variant adds whitespace. Stripped from a target nick before
 # validation — the LLM occasionally passes a channel name as the target
 # (the same failure mode set_reminder hit in security review L5).
-_CHANNEL_PREFIXES = " \t#&+!"
+_CHANNEL_PREFIXES = " \t" + CHANNEL_PREFIXES
 
 
 def actor_key(nick: str, account: str | None) -> str:
@@ -1887,11 +1892,8 @@ place is what stops the command path and this path from drifting apart.
 
 from __future__ import annotations
 
-import logging
-
 from . import Tool, ToolContext, register
-
-log = logging.getLogger(__name__)
+from ..tells import CHANNEL_PREFIXES
 
 
 async def _leave_message(ctx: ToolContext, args: dict) -> dict:
@@ -1899,7 +1901,10 @@ async def _leave_message(ctx: ToolContext, args: dict) -> dict:
     store = getattr(bot, "tell_store", None) if bot is not None else None
     if store is None:
         return {"error": "the tell relay is not available"}
-    if not ctx.channel or not ctx.channel.startswith(("#", "&")):
+    # CHANNEL_PREFIXES rather than a local literal: a second, narrower copy
+    # would misread a `+`- or `!`-prefixed channel as a DM and refuse a
+    # legitimate tell.
+    if not ctx.channel or not ctx.channel.startswith(tuple(CHANNEL_PREFIXES)):
         return {"error": "tells can only be left in a channel, not in a DM"}
 
     target = (args.get("target_nick") or "").strip()
