@@ -530,6 +530,9 @@ class TellStore:
         self._rate_last_sweep: float = 0.0
         # Serialises the whole query -> post -> mark sequence in deliver().
         self._deliver_lock = asyncio.Lock()
+        # Serialises the cap-check -> insert sequence in create(). See the
+        # comment at its use site for why those two DB calls must be atomic.
+        self._create_lock = asyncio.Lock()
 
     # ---- creation ----
 
@@ -588,7 +591,7 @@ class TellStore:
             details={"tell_id": tell_id, "to_nick": target, "chars": len(body)},
         )
 
-        note = " (truncated to 400 chars)" if truncated else ""
+        note = f" (truncated to {TELL_MAX_MESSAGE_LEN} chars)" if truncated else ""
         return TellResult(
             True,
             f"ok — I'll tell {target} when they're next around{note}. "
@@ -828,31 +831,44 @@ that same line, so the rest of the method is untouched:
         from_key = actor_key(from_nick, from_account)
         target_lower = target.lower()
 
-        pair_pending = await self._count_pending(channel, target_lower, from_key)
-        if pair_pending >= TELL_MAX_PENDING_PER_PAIR:
-            return TellResult(
-                False,
-                f"(you already have {pair_pending} message(s) waiting for "
-                f"{target} here — use !untell to clear one first)",
-            )
+        # The cap checks and the INSERT must be atomic. ircclient dispatches
+        # command handlers with asyncio.create_task, so two !tell calls can
+        # interleave at any await boundary in between — and there are three.
+        # Without this lock both callers read a count one below the cap and
+        # both insert, which is precisely the flood the durable caps exist
+        # to stop. _count_pending alone being DB-backed is not enough:
+        # surviving a restart and being race-free are different properties.
+        #
+        # Lock order: _create_lock may be held while _check_rate takes
+        # _rate_lock. Nothing acquires them in the other order, and deliver()
+        # takes only _deliver_lock and never calls create(), so there is no
+        # cycle to deadlock on.
+        async with self._create_lock:
+            pair_pending = await self._count_pending(channel, target_lower, from_key)
+            if pair_pending >= TELL_MAX_PENDING_PER_PAIR:
+                return TellResult(
+                    False,
+                    f"(you already have {pair_pending} message(s) waiting for "
+                    f"{target} here — use !untell to clear one first)",
+                )
 
-        total_pending = await self._count_pending(channel, target_lower, None)
-        if total_pending >= TELL_MAX_PENDING_PER_RECIPIENT:
-            return TellResult(
-                False,
-                f"(too many messages already waiting for {target} here; "
-                f"try again once they've picked some up)",
-            )
+            total_pending = await self._count_pending(channel, target_lower, None)
+            if total_pending >= TELL_MAX_PENDING_PER_RECIPIENT:
+                return TellResult(
+                    False,
+                    f"(too many messages already waiting for {target} here; "
+                    f"try again once they've picked some up)",
+                )
 
-        allowed, remaining = await self._check_rate(from_key)
-        if not allowed:
-            log.info("tell rate-limited for %s in %s", from_key, channel)
-            return TellResult(
-                False,
-                f"(rate limit: {TELL_RATE_LIMIT} tells an hour. Try later.)",
-            )
+            allowed, _remaining = await self._check_rate(from_key)
+            if not allowed:
+                log.info("tell rate-limited for %s in %s", from_key, channel)
+                return TellResult(
+                    False,
+                    f"(rate limit: {TELL_RATE_LIMIT} tells an hour. Try later.)",
+                )
 
-        now = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc)
 ```
 
 - [ ] **Step 6: Run the tests to verify they pass**
