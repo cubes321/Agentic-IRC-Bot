@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from bot.db import Database
+from bot.db import Database, now_utc_iso
 
 
 async def test_tells_table_exists(db: Database):
@@ -276,3 +276,69 @@ async def test_concurrent_create_cannot_exceed_pair_cap(store, monkeypatch):
         "WHERE to_nick_lower = 'dave' AND delivered_at IS NULL"
     )
     assert len(rows) == TELL_MAX_PENDING_PER_PAIR
+
+
+async def test_pending_for_matches_exact_nick(store):
+    await _leave(store, to="dave")
+    rows = await store.pending_for("#test", "dave", None)
+    assert len(rows) == 1
+
+
+async def test_pending_for_matches_nick_case_insensitively(store):
+    await _leave(store, to="DaVe")
+    rows = await store.pending_for("#test", "dAvE", None)
+    assert len(rows) == 1
+
+
+async def test_pending_for_matches_on_account_when_nick_changed(store):
+    # The whole point of the hybrid: dave was known as "dave" with account
+    # "dave_acct" when the tell was left, and comes back as "dave_".
+    await store.create(
+        channel="#test", from_nick="alice", from_account=None,
+        to_nick="dave", to_account="dave_acct", message="hi",
+        bot_nick="TestBot",
+    )
+    rows = await store.pending_for("#test", "dave_", "dave_acct")
+    assert len(rows) == 1
+
+
+async def test_pending_for_ignores_unrelated_people(store):
+    await _leave(store, to="dave")
+    assert await store.pending_for("#test", "erin", "erin_acct") == []
+
+
+async def test_pending_for_does_not_match_null_account(store):
+    # A tell with to_account NULL must not match everyone who arrives
+    # without an account. Guards a NULL-comparison mistake in the WHERE.
+    await _leave(store, to="dave")
+    assert await store.pending_for("#test", "erin", None) == []
+
+
+async def test_pending_for_is_channel_scoped(store):
+    await _leave(store, to="dave", channel="#test")
+    assert await store.pending_for("#other", "dave", None) == []
+
+
+async def test_pending_for_skips_expired(store):
+    await _leave(store, to="dave")
+    await store.db.execute(
+        "UPDATE tells SET expires_at = ?", ("2020-01-01T00:00:00+00:00",)
+    )
+    assert await store.pending_for("#test", "dave", None) == []
+
+
+async def test_pending_for_skips_delivered(store):
+    await _leave(store, to="dave")
+    await store.db.execute("UPDATE tells SET delivered_at = ?", (now_utc_iso(),))
+    assert await store.pending_for("#test", "dave", None) == []
+
+
+async def test_pending_for_is_oldest_first(store):
+    for i in range(3):
+        await store.create(
+            channel="#test", from_nick="alice", from_account=None,
+            to_nick="dave", to_account=None, message=f"msg{i}",
+            bot_nick="TestBot",
+        )
+    rows = await store.pending_for("#test", "dave", None)
+    assert [r["message"] for r in rows] == ["msg0", "msg1", "msg2"]

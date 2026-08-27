@@ -264,6 +264,30 @@ class TellStore:
         row = await self.db.fetchone(sql, params)
         return int(row["n"]) if row else 0
 
+    async def pending_for(
+        self, channel: str, nick: str, account: str | None
+    ) -> list[Any]:
+        """Undelivered, unexpired tells waiting for this person in this
+        channel, oldest first.
+
+        Hybrid match: the arriving nick equals the stored nick (case
+        insensitive), OR their account equals the account we resolved when
+        the tell was left. The second arm is what catches `dave` coming
+        back as `dave_`.
+
+        The `to_account IS NOT NULL` guard is load-bearing. Without it, an
+        arriving user with no account (account = None) would match every
+        tell whose to_account is also NULL — i.e. the first person to speak
+        would collect everyone's messages."""
+        return await self.db.fetchall(
+            "SELECT * FROM tells "
+            "WHERE channel = ? AND delivered_at IS NULL AND expires_at > ? "
+            "AND (to_nick_lower = ? "
+            "     OR (to_account IS NOT NULL AND ? IS NOT NULL AND to_account = ?)) "
+            "ORDER BY created_at ASC, id ASC",
+            (channel, now_utc_iso(), (nick or "").lower(), account, account),
+        )
+
     @staticmethod
     def _clean_target_nick(raw: str) -> str | None:
         """Strip channel prefixes and whitespace, then validate the shape.
