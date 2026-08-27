@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS tells (
   channel       TEXT NOT NULL,
   from_nick     TEXT NOT NULL,
   from_account  TEXT,
+  from_key      TEXT NOT NULL,        -- account, else 'nick:<lower>' — see below
   to_nick       TEXT NOT NULL,        -- as typed, for display
   to_nick_lower TEXT NOT NULL,        -- matching key
   to_account    TEXT,                 -- resolved at creation if known
@@ -128,7 +129,19 @@ CREATE TABLE IF NOT EXISTS tells (
 );
 CREATE INDEX IF NOT EXISTS idx_tells_pending ON tells(channel, to_nick_lower, delivered_at);
 CREATE INDEX IF NOT EXISTS idx_tells_account ON tells(channel, to_account, delivered_at);
+CREATE INDEX IF NOT EXISTS idx_tells_from ON tells(channel, from_key, delivered_at);
 ```
+
+**`from_key` — one column that makes three queries exact.** The sender's
+identity is "account if they have one, else nick", the same fallback
+`set_reminder` uses for its rate-limit key. Storing that resolved key
+once, at creation, turns the per-pair cap, `!tells`, and the `!untell`
+ownership check into plain indexed equality tests. Without it each of the
+three needs a `(from_account = ? AND from_account IS NOT NULL) OR
+(from_account IS NULL AND lower(from_nick) = ?)` clause — three chances
+to get the same tricky predicate subtly different. The `nick:` prefix
+keeps the namespaces from colliding: account `alice` and nick `alice`
+must not be treated as the same person.
 
 `CREATE TABLE IF NOT EXISTS` means no migration entry is required; the
 existing `bot.sqlite` picks the table up on next open, same as every
@@ -196,9 +209,15 @@ limit standing between a user and a queue of unwanted messages from
 someone else. The per-pair and per-recipient caps are a `COUNT` on an
 indexed column, which is cheap enough to do on every create.
 
-**Actor key** for the hourly limit: the account where available, else
-`nick:<lowernick>`, so the two namespaces cannot collide — the same
-scheme `set_reminder` uses.
+**Actor key** for the hourly limit: the same `from_key` described above,
+produced by a single module-level `actor_key(nick, account)` helper that
+the store, the commands and the tool all share.
+
+**Rate-limit state lives on the `TellStore` instance**, not in module
+globals as `set_reminder`'s does. The app builds exactly one store, so
+behaviour is identical — but a test can construct a fresh store per case
+instead of reaching into another module's globals to reset them. Same
+reasoning for the delivery lock.
 
 **Target nick validation:**
 
