@@ -28,6 +28,9 @@ log = logging.getLogger(__name__)
 MAX_LINE_LEN = 400
 INTER_LINE_DELAY = 0.5
 MAX_LINES_PER_REPLY = 5
+# Wire-line cap for `!tells` output. Below the task-result cap because this
+# command is cheap and repeatable by any user.
+MAX_TELL_LIST_WIRE_LINES = 8
 # Pace between JOINs at startup. Quakenet's flood protection silently drops
 # JOINs that come too fast in the first seconds after connect. 0.7s is
 # conservative; tune lower if your network is permissive.
@@ -172,6 +175,8 @@ class IRCBot(pydle.Client):
         if user == self.nickname:
             log.info("Joined %s", channel)
             return
+        if user.lower() in self._ignore:
+            return
         # Someone else arrived — they may have messages waiting.
         asyncio.create_task(self._maybe_deliver_tells(channel, user))
 
@@ -267,7 +272,7 @@ class IRCBot(pydle.Client):
         # the message log stays continuous up to the very last second; we'd
         # rather have an extra row than a gap in the transcript.
         if not is_dm:
-            account = self._cached_account_or_none(source)
+            account = self.cached_account_or_none(source)
             await self.db.log_message(target, source, account, message)
             if self.memory_writer is not None:
                 self.memory_writer.note_message(target)
@@ -357,7 +362,7 @@ class IRCBot(pydle.Client):
 
         # Make sure we have an account cached if possible.
         await self._ensure_account_known(source)
-        account = self._cached_account_or_none(source)
+        account = self.cached_account_or_none(source)
 
         channel_for_policy = reply_target if not is_dm else target  # for DMs, target == bot nick; treat as private quiet
         policy = self._policy_for(channel_for_policy if not is_dm else "")
@@ -421,7 +426,7 @@ class IRCBot(pydle.Client):
         # show actions identifiably (matches IRC client convention).
         formatted = f"* {by} {contents}"
         if not is_dm:
-            account = self._cached_account_or_none(by)
+            account = self.cached_account_or_none(by)
             await self.db.log_message(target, by, account, formatted)
             if self.memory_writer is not None:
                 self.memory_writer.note_message(target)
@@ -450,7 +455,7 @@ class IRCBot(pydle.Client):
             return
 
         await self._ensure_account_known(by)
-        account = self._cached_account_or_none(by)
+        account = self.cached_account_or_none(by)
 
         channel_for_policy = reply_target if not is_dm else target
         policy = self._policy_for(channel_for_policy if not is_dm else "")
@@ -519,7 +524,7 @@ class IRCBot(pydle.Client):
         prevents anyone who happens to be opped in #foo from killing the
         bot for everyone else."""
         await self._ensure_account_known(source)
-        account = self._cached_account_or_none(source)
+        account = self.cached_account_or_none(source)
         if not self.auth.is_operator(account):
             log.warning(
                 "!quit refused: %s (account=%r) is not an operator",
@@ -647,7 +652,7 @@ class IRCBot(pydle.Client):
             return
 
         await self._ensure_account_known(source)
-        account = self._cached_account_or_none(source)
+        account = self.cached_account_or_none(source)
         is_operator = self.auth.is_operator(account)
 
         msg = await self.task_runner.cancel_task(
@@ -707,14 +712,14 @@ class IRCBot(pydle.Client):
         # Resolve the sender's account so the rate limit and !untell
         # ownership follow them across nick changes.
         await self._ensure_account_known(source)
-        from_account = self._cached_account_or_none(source)
+        from_account = self.cached_account_or_none(source)
         # Opportunistically resolve the TARGET's account too. If they're
         # around (or were recently), this is what lets the tell still find
         # them when they come back as "dave_". A miss is fine and common —
         # we fall back to nick matching. Deliberately no WHOIS here: the
         # target is usually offline, and WHOIS on an absent nick just
         # returns 401.
-        to_account = self._cached_account_or_none(to_nick)
+        to_account = self.cached_account_or_none(to_nick)
 
         try:
             result = await self.tell_store.create(
@@ -740,7 +745,7 @@ class IRCBot(pydle.Client):
             return
 
         await self._ensure_account_known(source)
-        account = self._cached_account_or_none(source)
+        account = self.cached_account_or_none(source)
         try:
             rows = await self.tell_store.list_from(channel, source, account)
         except Exception:
@@ -752,11 +757,23 @@ class IRCBot(pydle.Client):
             await self.irc_send(channel, f"{source}: no tells waiting from you here.")
             return
 
+        # Wire-line budget, not just a row cap: a long message wraps to more
+        # than one PRIVMSG, so counting rows would not bound what actually
+        # goes out. Same reason tasks._post_result accumulates irc_send's
+        # return value.
+        sent = 0
         for r in rows:
+            if sent >= MAX_TELL_LIST_WIRE_LINES:
+                await self.irc_send(
+                    channel,
+                    f"  (…{len(rows) - sent} more not shown; "
+                    f"use !untell <id> to clear some)",
+                )
+                break
             preview = (r["message"] or "")[:60]
             if len(r["message"] or "") > 60:
                 preview += "…"
-            await self.irc_send(
+            sent += await self.irc_send(
                 channel,
                 f"  #{r['id']} -> {r['to_nick']} ({human_age(r['created_at'])}): {preview}",
             )
@@ -777,9 +794,10 @@ class IRCBot(pydle.Client):
             return
 
         await self._ensure_account_known(source)
-        account = self._cached_account_or_none(source)
+        account = self.cached_account_or_none(source)
         try:
             result = await self.tell_store.cancel(
+                channel=channel,
                 tell_id=tell_id,
                 actor_nick=source,
                 actor_account=account,
@@ -835,7 +853,7 @@ class IRCBot(pydle.Client):
         if self.tell_store is None or nick == self.nickname:
             return
         try:
-            account = self._cached_account_or_none(nick)
+            account = self.cached_account_or_none(nick)
             await self.tell_store.deliver(self, channel, nick, account)
         except Exception:
             log.exception("tell delivery failed for %s in %s", nick, channel)
@@ -846,7 +864,12 @@ class IRCBot(pydle.Client):
         cfg = self.cfg.channel(channel) if channel else self.cfg.channel("")
         return ChannelPolicy(channel or "(dm)", cfg, self.cfg)
 
-    def _cached_account_or_none(self, nick: str) -> str | None:
+    def cached_account_or_none(self, nick: str) -> str | None:
+        """Return the cached services account for `nick`, or None if we
+        have no cached answer (never triggers a WHOIS).
+
+        Public because bot/tools/tell.py resolves a tell's target account
+        through it."""
         cached = self.auth.get_cached(nick)
         from .auth import _MISS
         if cached is _MISS:
@@ -888,7 +911,7 @@ class IRCBot(pydle.Client):
             return True
         # 'operators' and 'allowlist' both depend on the sender's account.
         await self._ensure_account_known(source)
-        account = self._cached_account_or_none(source)
+        account = self.cached_account_or_none(source)
         if self.auth.is_operator(account):
             return True
         if mode == "operators":

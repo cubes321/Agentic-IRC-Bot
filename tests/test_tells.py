@@ -3,10 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
+from bot.config import AICfg, ChannelCfg, Config, ServerCfg
 from bot.db import Database, now_utc_iso
+from bot.tells import (
+    TELL_LIST_LIMIT,
+    TELL_MAX_DELIVER_PER_ARRIVAL,
+    TELL_MAX_MESSAGE_LEN,
+    TELL_MAX_PENDING_PER_PAIR,
+    TELL_MAX_PENDING_PER_RECIPIENT,
+    TELL_RATE_LIMIT,
+    TellStore,
+    actor_key,
+    human_age,
+)
 
 
 async def test_tells_table_exists(db: Database):
@@ -27,17 +40,7 @@ async def test_tells_table_columns(db: Database):
 
 
 def test_allow_tell_defaults_true():
-    from bot.config import ChannelCfg
     assert ChannelCfg().allow_tell is True
-
-
-from bot.tells import (
-    TELL_MAX_DELIVER_PER_ARRIVAL,
-    TELL_MAX_MESSAGE_LEN,
-    TellStore,
-    actor_key,
-    human_age,
-)
 
 
 def test_actor_key_prefers_account():
@@ -76,6 +79,24 @@ async def test_create_stores_normalised_fields(store: TellStore):
     assert row["delivered_at"] is None
 
 
+async def test_create_audits_message_preview(store: TellStore):
+    # The only other copy of a tell's text is tells.message, which cancel()
+    # hard-deletes and prune() removes after 30 days. Without a preview in
+    # the audit row, an abuser who withdraws before delivery leaves no
+    # record of what was staged.
+    await store.create(
+        channel="#test", from_nick="alice", from_account=None,
+        to_nick="dave", to_account=None,
+        message="secret rendezvous details", bot_nick="TestBot",
+    )
+    row = await store.db.fetchone(
+        "SELECT details FROM audit WHERE action = 'tell.create'"
+    )
+    assert row is not None
+    details = json.loads(row["details"])
+    assert "secret rendezvous details" in details["message_preview"]
+
+
 # NB: "#geeks" is deliberately NOT in this list. Channel prefixes are
 # stripped BEFORE validation (spec step 1, the L5 fix), so "#geeks"
 # becomes the valid nick "geeks" and is accepted — see
@@ -89,7 +110,9 @@ async def test_create_rejects_bad_target_nicks(store: TellStore, bad: str):
     assert r.ok is False
 
 
-@pytest.mark.parametrize("good", ["dave", "Dave_", "d-a-v-e", "[dave]", "da|ve"])
+@pytest.mark.parametrize(
+    "good", ["dave", "Dave_", "d-a-v-e", "[dave]", "da|ve", "dave,", "dave:"]
+)
 async def test_create_accepts_valid_nicks(store: TellStore, good: str):
     r = await store.create(
         channel="#test", from_nick="alice", from_account=None,
@@ -105,6 +128,20 @@ async def test_create_strips_channel_prefix_then_validates(store: TellStore):
     r = await store.create(
         channel="#test", from_nick="alice", from_account=None,
         to_nick="#dave", to_account=None, message="hi", bot_nick="TestBot",
+    )
+    assert r.ok is True
+    row = await store.db.fetchone("SELECT to_nick_lower FROM tells")
+    assert row["to_nick_lower"] == "dave"
+
+
+@pytest.mark.parametrize("raw", ["dave,", "dave:"])
+async def test_create_strips_trailing_punctuation(store: TellStore, raw: str):
+    # "!tell dave, hi" and "!tell dave: hi" are how people naturally address
+    # each other in chat; the trailing punctuation must not be part of the
+    # stored nick.
+    r = await store.create(
+        channel="#test", from_nick="alice", from_account=None,
+        to_nick=raw, to_account=None, message="hi", bot_nick="TestBot",
     )
     assert r.ok is True
     row = await store.db.fetchone("SELECT to_nick_lower FROM tells")
@@ -151,9 +188,6 @@ async def test_create_truncates_long_message(store: TellStore):
 async def test_create_refused_when_allow_tell_false(tmp_path):
     # Built inline rather than via a conftest helper: `tests/` has no
     # __init__.py, so `from tests.conftest import ...` would not resolve.
-    from bot.config import AICfg, ChannelCfg, Config, ServerCfg
-    from bot.db import Database
-
     database = Database(tmp_path / "off.sqlite")
     await database.open()
     try:
@@ -173,17 +207,11 @@ async def test_create_refused_when_allow_tell_false(tmp_path):
         await database.close()
 
 
-from bot.tells import (
-    TELL_MAX_PENDING_PER_PAIR,
-    TELL_MAX_PENDING_PER_RECIPIENT,
-    TELL_RATE_LIMIT,
-)
-
-
-async def _leave(store, to="dave", frm="alice", account=None, channel="#test"):
+async def _leave(store, to="dave", frm="alice", account=None, channel="#test",
+                  to_account=None):
     return await store.create(
         channel=channel, from_nick=frm, from_account=account,
-        to_nick=to, to_account=None, message="hi", bot_nick="TestBot",
+        to_nick=to, to_account=to_account, message="hi", bot_nick="TestBot",
     )
 
 
@@ -231,6 +259,31 @@ async def test_pending_per_pair_cap_is_per_recipient(store, monkeypatch):
         await _leave(store, to="dave")
     r = await _leave(store, to="erin")   # different recipient, fresh pair
     assert r.ok is True
+
+
+async def test_pending_cap_counts_account_matched_tells(store, monkeypatch):
+    # _count_pending must use the same nick-OR-account predicate as
+    # pending_for. Without that, a sender could land more than
+    # TELL_MAX_PENDING_PER_PAIR tells on one account holder simply by
+    # respelling their nick ("dave", "dave_", "dave__", ...) each time —
+    # each respelling would look like a fresh, empty pair to a nick-only
+    # counter, even though every tell resolves to the same to_account.
+    monkeypatch.setattr("bot.tells.TELL_RATE_LIMIT", 100)
+    spellings = ["dave", "dave_", "dave__", "dave___", "dave____", "dave_____"]
+    assert len(spellings) > TELL_MAX_PENDING_PER_PAIR
+    made = 0
+    for nick in spellings:
+        r = await _leave(store, to=nick, to_account="dave_acct")
+        if r.ok:
+            made += 1
+        else:
+            assert "already" in r.message.lower()
+            break
+    assert made == TELL_MAX_PENDING_PER_PAIR, (
+        f"cap should have fired at {TELL_MAX_PENDING_PER_PAIR}, made {made}"
+    )
+    pending = await store.pending_for("#test", "dave", "dave_acct")
+    assert len(pending) <= TELL_MAX_PENDING_PER_PAIR
 
 
 async def test_pending_per_recipient_cap_across_senders(store):
@@ -518,28 +571,40 @@ async def test_list_from_matches_on_account_not_nick(store):
     assert len(rows) == 1
 
 
+async def test_list_from_caps_at_limit(store, monkeypatch):
+    # Lift the hourly cap so we have headroom to exceed TELL_LIST_LIMIT;
+    # each tell goes to a distinct recipient so the per-recipient caps
+    # don't bite first.
+    monkeypatch.setattr("bot.tells.TELL_RATE_LIMIT", 100)
+    for i in range(TELL_LIST_LIMIT + 5):
+        r = await _leave(store, to=f"dave{i}")
+        assert r.ok is True, f"create #{i + 1} should have been allowed"
+    rows = await store.list_from("#test", "alice", None)
+    assert len(rows) == TELL_LIST_LIMIT
+
+
 async def test_cancel_by_owner(store):
     r = await _leave(store, to="dave", frm="alice")
-    c = await store.cancel(r.tell_id, "alice", None, is_operator=False)
+    c = await store.cancel("#test", r.tell_id, "alice", None, is_operator=False)
     assert c.ok is True
     assert await store.pending_for("#test", "dave", None) == []
 
 
 async def test_cancel_refused_for_stranger(store):
     r = await _leave(store, to="dave", frm="alice")
-    c = await store.cancel(r.tell_id, "mallory", None, is_operator=False)
+    c = await store.cancel("#test", r.tell_id, "mallory", None, is_operator=False)
     assert c.ok is False
     assert len(await store.pending_for("#test", "dave", None)) == 1
 
 
 async def test_cancel_allowed_for_operator(store):
     r = await _leave(store, to="dave", frm="alice")
-    c = await store.cancel(r.tell_id, "root", "root_acct", is_operator=True)
+    c = await store.cancel("#test", r.tell_id, "root", "root_acct", is_operator=True)
     assert c.ok is True
 
 
 async def test_cancel_unknown_id(store):
-    c = await store.cancel(9999, "alice", None, is_operator=False)
+    c = await store.cancel("#test", 9999, "alice", None, is_operator=False)
     assert c.ok is False
     assert "no pending tell" in c.message.lower()
 
@@ -547,8 +612,34 @@ async def test_cancel_unknown_id(store):
 async def test_cancel_already_delivered(store):
     r = await _leave(store, to="dave", frm="alice")
     await store.deliver(FakeBot(), "#test", "dave", None)
-    c = await store.cancel(r.tell_id, "alice", None, is_operator=False)
+    c = await store.cancel("#test", r.tell_id, "alice", None, is_operator=False)
     assert c.ok is False
+
+
+async def test_cancel_is_channel_scoped(store):
+    r = await _leave(store, to="dave", frm="alice", channel="#test")
+    c = await store.cancel("#other", r.tell_id, "alice", None, is_operator=False)
+    assert c.ok is False
+    assert len(await store.pending_for("#test", "dave", None)) == 1
+
+
+async def test_cancel_refusals_are_indistinguishable(store):
+    # Unknown id vs. someone else's tell must read identically, so probing
+    # !untell across ids can't be used to map which ids are live. The
+    # message embeds the id the caller already typed, so a fair literal
+    # comparison needs the SAME id under both refusal reasons: probe
+    # while the tell still exists (not-mine), then let the real owner
+    # cancel it for real and probe the same id again (now truly unknown).
+    r = await _leave(store, to="dave", frm="alice")
+    not_mine = await store.cancel("#test", r.tell_id, "mallory", None, is_operator=False)
+    assert not_mine.ok is False
+
+    owner_cancel = await store.cancel("#test", r.tell_id, "alice", None, is_operator=False)
+    assert owner_cancel.ok is True
+
+    unknown = await store.cancel("#test", r.tell_id, "mallory", None, is_operator=False)
+    assert unknown.ok is False
+    assert unknown.message == not_mine.message
 
 
 async def test_prune_removes_old_delivered_and_expired(store):

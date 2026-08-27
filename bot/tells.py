@@ -64,10 +64,27 @@ TELL_MAX_PENDING_PER_RECIPIENT = 15  # at one recipient, all senders combined
 # task-result wire cap exists to prevent.
 TELL_MAX_DELIVER_PER_ARRIVAL = 3
 
+# Cap on how many tells `!tells` lists. Mirrors tasks.LIST_LIMIT. The store
+# enforces it rather than trusting the caller: an unbounded list handed to a
+# handler that posts one line per row is an excess-flood disconnect waiting
+# to happen (see the task-result cap in tasks.py for the same lesson).
+TELL_LIST_LIMIT = 10
+
 # RFC 2812 nick shape: a letter or one of the "special" characters first,
 # then letters, digits, specials, or '-'. Without this check,
 # `!tell hi there everyone` silently files a tell for a user named "hi".
 NICK_RE = re.compile(r"^[A-Za-z\[\]\\`_^{|}][A-Za-z0-9\[\]\\`_^{|}\-]{0,31}$")
+
+# One definition of "is this tell for this person", shared by the delivery
+# lookup and the cap counter. Written once because the two diverged the
+# first time round: pending_for matched nick-OR-account while _count_pending
+# counted nick only, so a sender could walk straight past the per-recipient
+# cap by spelling the target's nick three different ways. Parameters, in
+# order: to_nick_lower, account, account.
+_RECIPIENT_MATCH_SQL = (
+    "(to_nick_lower = ? "
+    " OR (to_account IS NOT NULL AND ? IS NOT NULL AND to_account = ?))"
+)
 
 # Channel name prefixes per RFC 2811 — one definition, exported, because
 # two places need it and a narrower second copy is a bug waiting to happen:
@@ -194,7 +211,9 @@ class TellStore:
         # takes only _deliver_lock and never calls create(), so there is no
         # cycle to deadlock on.
         async with self._create_lock:
-            pair_pending = await self._count_pending(channel, target_lower, from_key)
+            pair_pending = await self._count_pending(
+                channel, target_lower, to_account, from_key
+            )
             if pair_pending >= TELL_MAX_PENDING_PER_PAIR:
                 return TellResult(
                     False,
@@ -202,7 +221,9 @@ class TellStore:
                     f"{target} here — use !untell to clear one first)",
                 )
 
-            total_pending = await self._count_pending(channel, target_lower, None)
+            total_pending = await self._count_pending(
+                channel, target_lower, to_account, None
+            )
             if total_pending >= TELL_MAX_PENDING_PER_RECIPIENT:
                 return TellResult(
                     False,
@@ -238,7 +259,12 @@ class TellStore:
             channel=channel,
             actor_nick=from_nick,
             actor_account=from_account,
-            details={"tell_id": tell_id, "to_nick": target, "chars": len(body)},
+            details={
+                "tell_id": tell_id,
+                "to_nick": target,
+                "chars": len(body),
+                "message_preview": body[:200],
+            },
         )
 
         note = f" (truncated to {TELL_MAX_MESSAGE_LEN} chars)" if truncated else ""
@@ -279,15 +305,25 @@ class TellStore:
             return True, TELL_RATE_LIMIT - len(fresh)
 
     async def _count_pending(
-        self, channel: str, to_nick_lower: str, from_key: str | None
+        self,
+        channel: str,
+        to_nick_lower: str,
+        to_account: str | None,
+        from_key: str | None,
     ) -> int:
         """Pending, unexpired tells for a recipient in a channel. With
-        `from_key`, narrowed to those from one sender."""
-        params: list[Any] = [channel, to_nick_lower, now_utc_iso()]
+        `from_key`, narrowed to those from one sender.
+
+        Uses the same nick-OR-account predicate as pending_for
+        (_RECIPIENT_MATCH_SQL) rather than nick alone — a narrower
+        predicate here than in pending_for would let a sender land more
+        tells on one account-holding recipient than the cap allows, simply
+        by spelling their nick a few different ways."""
+        params: list[Any] = [channel, now_utc_iso(), to_nick_lower, to_account, to_account]
         sql = (
             "SELECT COUNT(*) AS n FROM tells "
-            "WHERE channel = ? AND to_nick_lower = ? "
-            "AND delivered_at IS NULL AND expires_at > ?"
+            "WHERE channel = ? AND delivered_at IS NULL AND expires_at > ? "
+            f"AND {_RECIPIENT_MATCH_SQL}"
         )
         if from_key is not None:
             sql += " AND from_key = ?"
@@ -319,8 +355,7 @@ class TellStore:
         return await self.db.fetchall(
             "SELECT * FROM tells "
             "WHERE channel = ? AND delivered_at IS NULL AND expires_at > ? "
-            "AND (to_nick_lower = ? "
-            "     OR (to_account IS NOT NULL AND ? IS NOT NULL AND to_account = ?)) "
+            f"AND {_RECIPIENT_MATCH_SQL} "
             "ORDER BY created_at ASC, id ASC",
             (channel, now_utc_iso(), (nick or "").lower(), account, account),
         )
@@ -424,17 +459,22 @@ class TellStore:
     ) -> list[Any]:
         """Pending tells this person left in this channel, oldest first.
         Identity is from_key, so it follows their account across nick
-        changes rather than being defeated by one."""
+        changes rather than being defeated by one.
+
+        Capped at TELL_LIST_LIMIT: the caller posts one wire line per row,
+        so an unbounded result here is an excess-flood disconnect waiting
+        to happen (see the module docstring on TELL_LIST_LIMIT)."""
         return await self.db.fetchall(
             "SELECT * FROM tells "
             "WHERE channel = ? AND from_key = ? "
             "AND delivered_at IS NULL AND expires_at > ? "
-            "ORDER BY created_at ASC, id ASC",
-            (channel, actor_key(nick, account), now_utc_iso()),
+            "ORDER BY created_at ASC, id ASC LIMIT ?",
+            (channel, actor_key(nick, account), now_utc_iso(), TELL_LIST_LIMIT),
         )
 
     async def cancel(
         self,
+        channel: str,
         tell_id: int,
         actor_nick: str,
         actor_account: str | None,
@@ -443,19 +483,27 @@ class TellStore:
         """Withdraw a tell before it is delivered. You may cancel your own;
         operators may cancel any. Already-delivered tells cannot be
         cancelled — that message is out, and pretending otherwise would be
-        worse than saying so."""
+        worse than saying so.
+
+        Channel-scoped (an id from #other is invisible here), and the two
+        refusal cases — no such id, and "it's not yours" — return the
+        identical message. Without both properties, probing !untell across
+        ids would let anyone map which ids are live pending tells anywhere
+        on the bot, and the success message would otherwise echo a
+        recipient nick from another channel into this one."""
         row = await self.db.fetchone(
-            "SELECT * FROM tells WHERE id = ?", (tell_id,)
+            "SELECT * FROM tells WHERE id = ? AND channel = ?", (tell_id, channel)
         )
+        refusal = TellResult(False, f"(no pending tell #{tell_id} of yours here)")
         if row is None or row["delivered_at"] is not None:
-            return TellResult(False, f"(no pending tell #{tell_id})")
+            return refusal
 
         if not is_operator and row["from_key"] != actor_key(actor_nick, actor_account):
             log.info(
                 "!untell refused: %s is not the owner of tell #%d",
                 actor_nick, tell_id,
             )
-            return TellResult(False, f"(tell #{tell_id} isn't yours to cancel)")
+            return refusal
 
         await self.db.execute("DELETE FROM tells WHERE id = ?", (tell_id,))
         await self.db.log_audit(
@@ -463,8 +511,12 @@ class TellStore:
             channel=row["channel"],
             actor_nick=actor_nick,
             actor_account=actor_account,
-            details={"tell_id": tell_id, "to_nick": row["to_nick"],
-                     "by_operator": is_operator},
+            details={
+                "tell_id": tell_id,
+                "to_nick": row["to_nick"],
+                "by_operator": is_operator,
+                "message_preview": (row["message"] or "")[:200],
+            },
         )
         return TellResult(
             True, f"cancelled tell #{tell_id} for {row['to_nick']}."
@@ -505,6 +557,10 @@ class TellStore:
         """Strip channel prefixes and whitespace, then validate the shape.
         Returns None if what's left isn't a usable nick."""
         candidate = (raw or "").strip().lstrip(_CHANNEL_PREFIXES).strip()
+        # People address each other as "dave," or "dave:" in chat, so those
+        # arrive as part of the target token. Strip them rather than refusing
+        # a request that is obviously well-formed to a human.
+        candidate = candidate.rstrip(",:").strip()
         if not candidate or not NICK_RE.match(candidate):
             return None
         return candidate

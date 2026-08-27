@@ -124,12 +124,18 @@ def _strip_text_tool_calls(text: str) -> str:
 #                       reminders to multiple people); spraying 30 is not
 #   - me_action   : 5 — actions are personality flourishes; a turn
 #                       doing 6+ is in flood territory regardless
+#   - leave_message: 2 — capped for the same reason private_msg is: it
+#                       makes the bot emit attributed text at a third
+#                       party, so one prompt-injected turn should not be
+#                       able to aim a whole hour's worth of tells at
+#                       one victim
 # Tools not in this dict have no per-turn cap (most info-retrieval tools
 # are naturally self-limiting via the step cap).
 _TIER5_PER_TURN_CAPS = {
     "set_topic": 1,
     "private_msg": 3,
     "me_action": 5,
+    "leave_message": 2,
 }
 
 

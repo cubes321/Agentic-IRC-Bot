@@ -30,12 +30,19 @@ async def _leave_message(ctx: ToolContext, args: dict) -> dict:
     if not message:
         return {"error": "message is empty"}
 
+    # Resolve the target's account the same way the !tell command does, so
+    # the two entry points produce identical rows. Cache-only, never a
+    # WHOIS: the target is usually offline and WHOIS on an absent nick just
+    # returns 401. A miss is fine — the tell then matches on nick alone.
+    resolve = getattr(bot, "cached_account_or_none", None)
+    to_account = resolve(target) if callable(resolve) else None
+
     result = await store.create(
         channel=ctx.channel,
         from_nick=ctx.actor_nick,
         from_account=ctx.actor_account,
         to_nick=target,
-        to_account=None,
+        to_account=to_account,
         message=message,
         bot_nick=getattr(bot, "nickname", ""),
     )
