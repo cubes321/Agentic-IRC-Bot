@@ -73,6 +73,20 @@ long task results, image generation, etc.).
 - Reminder loop polls the table every 10s (configurable), posts due
   reminders to the channel.
 
+**Tell relay** (`bot/tells.py` + `!tell` / `leave_message`)
+- `!tell <nick> <message>` leaves a message for someone who isn't around.
+- Delivered publicly in the same channel the first time that person is
+  next seen active there — they join, they speak, or they `/me`.
+- Matched on nick **or** Quakenet account, so `dave` returning as `dave_`
+  still gets the message.
+- `!tells` lists what you have pending; `!untell <id>` cancels one.
+- `leave_message` tool gives the LLM the same path conversationally.
+- Tells are **not private** — the whole channel sees them on delivery.
+- Limits: 5/hour per person, 5 pending per sender→recipient pair,
+  15 pending per recipient, 400 chars, 30-day expiry, 3 per arrival.
+- Per-channel `allow_tell` (default on) disables leaving new tells;
+  already-pending ones are still delivered.
+
 **Background tasks** (`bot/tasks.py`)
 - `!task <goal>` schedules a multi-step background task. 30-step /
   30-minute budgets; uses the full tool catalog; cancellable via
