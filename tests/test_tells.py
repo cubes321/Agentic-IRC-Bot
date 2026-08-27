@@ -31,7 +31,13 @@ def test_allow_tell_defaults_true():
     assert ChannelCfg().allow_tell is True
 
 
-from bot.tells import TELL_MAX_MESSAGE_LEN, TellStore, actor_key
+from bot.tells import (
+    TELL_MAX_DELIVER_PER_ARRIVAL,
+    TELL_MAX_MESSAGE_LEN,
+    TellStore,
+    actor_key,
+    human_age,
+)
 
 
 def test_actor_key_prefers_account():
@@ -348,22 +354,25 @@ async def test_pending_for_is_oldest_first(store):
     assert [r["message"] for r in rows] == ["msg0", "msg1", "msg2"]
 
 
-import asyncio
-
-from bot.tells import TELL_MAX_DELIVER_PER_ARRIVAL, human_age
-
-
 class FakeBot:
-    """Stand-in for IRCBot. Records what would go on the wire. Only
-    irc_send is needed — TellStore never touches anything else."""
+    """Stand-in for IRCBot. Records what would go on the wire.
 
-    def __init__(self, fail: bool = False):
+    Mirrors the real irc_send contract deliberately: it returns the count
+    of wire lines sent and, on a wire failure, returns 0 rather than
+    raising. An earlier version of this double raised instead, which made
+    the failure test pass while production would have silently dropped the
+    tell."""
+
+    def __init__(self, fail: bool = False, raises: bool = False):
         self.sent: list[tuple[str, str]] = []
         self.fail = fail
+        self.raises = raises
 
     async def irc_send(self, target: str, text: str, **kwargs) -> int:
-        if self.fail:
+        if self.raises:
             raise RuntimeError("wire is down")
+        if self.fail:
+            return 0          # what the real irc_send does on failure
         self.sent.append((target, text))
         return 1
 
@@ -450,3 +459,39 @@ async def test_concurrent_deliver_does_not_double_post(store):
     )
     assert sorted(results) == [0, 1]
     assert len(bot.sent) == 1
+
+
+async def test_deliver_leaves_row_pending_when_send_raises(store):
+    """Belt-and-braces: irc_send doesn't raise today, but if it ever does
+    the row must still be left pending."""
+    await _leave(store, to="dave")
+    assert await store.deliver(FakeBot(raises=True), "#test", "dave", None) == 0
+    row = await store.db.fetchone("SELECT delivered_at FROM tells")
+    assert row["delivered_at"] is None
+
+
+async def test_deliver_overflow_counts_unsent_batch_items(store):
+    """A send failing mid-batch leaves its row pending; the '+N more'
+    notice must count it, not just the rows beyond the per-arrival cap."""
+    for i in range(5):
+        await store.create(
+            channel="#test", from_nick=f"s{i}", from_account=None,
+            to_nick="dave", to_account=None, message=f"m{i}",
+            bot_nick="TestBot",
+        )
+
+    class FlakyBot(FakeBot):
+        """Sends the first tell, fails on the second, succeeds on overflow notice."""
+        async def irc_send(self, target: str, text: str, **kwargs) -> int:
+            # Fail on tell #2 (index 1 in sent), but succeed on overflow notice
+            if len(self.sent) == 1 and "[from" in text:
+                return 0
+            self.sent.append((target, text))
+            return 1
+
+    bot = FlakyBot()
+    delivered = await store.deliver(bot, "#test", "dave", None)
+    assert delivered == 1
+    # 5 pending, 1 delivered -> 4 still waiting, not 2.
+    # The overflow notice should be the last message sent.
+    assert "+4 more" in bot.sent[-1][1]
