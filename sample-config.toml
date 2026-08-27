@@ -168,6 +168,13 @@ auto_welcome = true
 # cost of one embedding call per turn. Default false; opt-in here.
 auto_recall = true
 auto_recall_k = 3
+# Presence-triggered message relay. When on, anyone in the channel can
+# leave a message for an absent user with `!tell <nick> <message>`; the
+# bot relays it publicly the first time that user is next seen active
+# here (join, message, or /me). Tells are NOT private — the whole
+# channel sees them. Set false to disable leaving new tells in this
+# channel; any already pending are still delivered.
+allow_tell = true
 
 [channels."##python"]
 mode = "quiet"

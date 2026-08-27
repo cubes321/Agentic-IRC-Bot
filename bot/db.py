@@ -100,6 +100,31 @@ CREATE TABLE IF NOT EXISTS audit (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_action ON audit(action);
+
+-- Presence-triggered message relay (`!tell`). A row is a message left for
+-- someone not currently around, delivered the first time they are seen
+-- active in the same channel. Soft-deleted on delivery (delivered_at) for
+-- the same reason memories are: it leaves a record of what the bot relayed
+-- to whom. `from_key` is the sender's resolved identity — their account if
+-- they have one, else 'nick:<lowercased nick>' — which makes the per-pair
+-- cap, !tells and the !untell ownership check plain indexed lookups.
+CREATE TABLE IF NOT EXISTS tells (
+  id            INTEGER PRIMARY KEY,
+  channel       TEXT NOT NULL,
+  from_nick     TEXT NOT NULL,
+  from_account  TEXT,
+  from_key      TEXT NOT NULL,
+  to_nick       TEXT NOT NULL,
+  to_nick_lower TEXT NOT NULL,
+  to_account    TEXT,
+  message       TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  expires_at    TEXT NOT NULL,
+  delivered_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tells_pending ON tells(channel, to_nick_lower, delivered_at);
+CREATE INDEX IF NOT EXISTS idx_tells_account ON tells(channel, to_account, delivered_at);
+CREATE INDEX IF NOT EXISTS idx_tells_from ON tells(channel, from_key, delivered_at);
 """
 
 

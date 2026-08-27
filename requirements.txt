@@ -16,3 +16,7 @@ Pint>=0.24
 ddgs>=0.1.0; python_version >= "3.9"
 duckduckgo-search>=6.2; python_version >= "3.9"
 lxml>=5.2
+
+# --- test-only (not needed to run the bot) ---
+pytest>=8.0
+pytest-asyncio>=0.23

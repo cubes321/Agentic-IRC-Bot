@@ -206,6 +206,11 @@ class ChannelCfg(BaseModel):
     # per reply turn (~100ms on CPU). Default off; opt-in per channel.
     auto_recall: bool = False
     auto_recall_k: int = 3
+    # Presence-triggered message relay (`!tell`). Gates CREATION only:
+    # setting this false stops new tells but still delivers ones already
+    # pending, so turning the feature off can never strand a message
+    # somebody already left. !tells and !untell keep working too.
+    allow_tell: bool = True
 
     @field_validator("tick_interval_sec")
     @classmethod
