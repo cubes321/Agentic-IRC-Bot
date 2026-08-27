@@ -2025,30 +2025,50 @@ In `README.md`, after the **Reminders** block in "What it does":
 
 - [ ] **Step 2: Add the CHANGELOG entry**
 
-At the top of `CHANGELOG.md`'s entry list, matching the file's existing slice format:
+`CHANGELOG.md` follows [Keep a Changelog](https://keepachangelog.com/),
+not a per-slice heading format. `## [Unreleased]` currently has `### Fixed`
+and `### Security` but **no `### Added`** — create one, and place it
+*above* `### Fixed`, since Keep a Changelog orders sections
+Added / Changed / Deprecated / Removed / Fixed / Security.
+
+Insert directly after the `## [Unreleased]` line:
 
 ```markdown
-### Tell relay — leave a message for an absent user
-
-`!tell <nick> <message>` holds a message and relays it publicly in-channel
-the first time the recipient is next seen active (join, message, or `/me`).
-Recipients are matched on nick **or** account, so a returning `dave_` still
-gets a tell left for `dave`. `!tells` lists your pending ones, `!untell <id>`
-cancels one, and a `leave_message` tool gives the LLM the same path.
-
-New `bot/tells.py` owns the new `tells` table and every rule — both entry
-points go through `TellStore.create()`, so the command and the tool cannot
-enforce differently. Abuse envelope follows the `set_reminder` house style
-(5/hour per actor, in-memory) but makes the per-sender/recipient and
-per-recipient caps DB-backed: those are what protect a user from someone
-else, so they must survive a restart. Delivery is soft-delete
-(`delivered_at`), capped at 3 per arrival to stay under IRC flood limits,
-and marks the row only after a successful send so a wire failure retries
-rather than losing the message. Per-channel `allow_tell` gates creation
-only, so switching it off can never strand pending messages.
-
-Also adds the repo's first test suite — `pytest` + `pytest-asyncio`,
-covering `TellStore` against a temp SQLite file.
+### Added
+- **Tell relay** — leave a message for someone who isn't around, and the
+  bot hands it over when they turn up.
+  - `!tell <nick> <message>` holds a message; it is relayed publicly in
+    the same channel the first time that person is next seen active
+    there. "Active" means any of three things, because a join-only
+    trigger misses someone who was already sitting in the channel idle:
+    they JOIN, they speak, or they `/me`.
+  - Recipients are matched on nick **or** Quakenet account, so a tell
+    left for `dave` still reaches him when he returns as `dave_`.
+  - `!tells` lists the tells you have pending in the channel; `!untell
+    <id>` withdraws one before it is delivered (operators may withdraw
+    any). A `leave_message` tool gives the LLM the same path, so "tell
+    dave I said hi when he's back" works conversationally.
+  - Tells are **not private** — the whole channel sees them on delivery.
+    That is deliberate: it keeps the bot from becoming an unlogged
+    whisper relay.
+  - New `bot/tells.py` owns the new `tells` table and every rule. Both
+    entry points go through `TellStore.create()`, so the command and the
+    tool cannot enforce differently.
+  - Abuse envelope follows the `set_reminder` house style — 5 tells an
+    hour per person, in memory — but makes the per-sender/recipient (5)
+    and per-recipient (15) pending caps DB-backed: those are what
+    protect a user from someone *else*, so they must survive a restart.
+    Also 400-char messages, 30-day expiry, and at most 3 handed over per
+    arrival to stay under IRC flood limits.
+  - Delivery is soft-delete (`delivered_at`) and marks the row only
+    after a confirmed successful send, so a wire failure retries on the
+    recipient's next activity rather than losing the message.
+  - Per-channel `allow_tell` (default on) gates *creation only* —
+    switching it off cannot strand messages someone already left.
+- **First test suite** — `pytest` + `pytest-asyncio`, covering
+  `TellStore` against a temporary SQLite file (61 tests). `TellStore` is
+  pure logic over the database with no IRC dependency, which is what
+  makes it testable without a live pydle.
 ```
 
 - [ ] **Step 3: Final full verification**
