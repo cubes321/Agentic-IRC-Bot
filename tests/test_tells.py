@@ -495,3 +495,73 @@ async def test_deliver_overflow_counts_unsent_batch_items(store):
     # 5 pending, 1 delivered -> 4 still waiting, not 2.
     # The overflow notice should be the last message sent.
     assert "+4 more" in bot.sent[-1][1]
+
+
+async def test_list_from_returns_only_your_own(store):
+    await _leave(store, to="dave", frm="alice")
+    await _leave(store, to="erin", frm="bob")
+    rows = await store.list_from("#test", "alice", None)
+    assert len(rows) == 1
+    assert rows[0]["to_nick"] == "dave"
+
+
+async def test_list_from_excludes_delivered(store):
+    await _leave(store, to="dave", frm="alice")
+    await store.db.execute("UPDATE tells SET delivered_at = ?", (now_utc_iso(),))
+    assert await store.list_from("#test", "alice", None) == []
+
+
+async def test_list_from_matches_on_account_not_nick(store):
+    await _leave(store, to="dave", frm="alice", account="alice_acct")
+    # Same person, different nick — their account is what identifies them.
+    rows = await store.list_from("#test", "alice_away", "alice_acct")
+    assert len(rows) == 1
+
+
+async def test_cancel_by_owner(store):
+    r = await _leave(store, to="dave", frm="alice")
+    c = await store.cancel(r.tell_id, "alice", None, is_operator=False)
+    assert c.ok is True
+    assert await store.pending_for("#test", "dave", None) == []
+
+
+async def test_cancel_refused_for_stranger(store):
+    r = await _leave(store, to="dave", frm="alice")
+    c = await store.cancel(r.tell_id, "mallory", None, is_operator=False)
+    assert c.ok is False
+    assert len(await store.pending_for("#test", "dave", None)) == 1
+
+
+async def test_cancel_allowed_for_operator(store):
+    r = await _leave(store, to="dave", frm="alice")
+    c = await store.cancel(r.tell_id, "root", "root_acct", is_operator=True)
+    assert c.ok is True
+
+
+async def test_cancel_unknown_id(store):
+    c = await store.cancel(9999, "alice", None, is_operator=False)
+    assert c.ok is False
+    assert "no pending tell" in c.message.lower()
+
+
+async def test_cancel_already_delivered(store):
+    r = await _leave(store, to="dave", frm="alice")
+    await store.deliver(FakeBot(), "#test", "dave", None)
+    c = await store.cancel(r.tell_id, "alice", None, is_operator=False)
+    assert c.ok is False
+
+
+async def test_prune_removes_old_delivered_and_expired(store):
+    old = "2020-01-01T00:00:00+00:00"
+    await _leave(store, to="dave")                        # keep: pending, fresh
+    r2 = await _leave(store, to="erin")
+    await store.db.execute(
+        "UPDATE tells SET delivered_at = ? WHERE id = ?", (old, r2.tell_id)
+    )                                                     # drop: long delivered
+    r3 = await _leave(store, to="fred")
+    await store.db.execute(
+        "UPDATE tells SET expires_at = ? WHERE id = ?", (old, r3.tell_id)
+    )                                                     # drop: expired
+    assert await store.prune() == 2
+    rows = await store.db.fetchall("SELECT to_nick FROM tells")
+    assert [r["to_nick"] for r in rows] == ["dave"]

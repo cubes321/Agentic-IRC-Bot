@@ -414,6 +414,87 @@ class TellStore:
                 )
             return delivered
 
+    async def list_from(
+        self, channel: str, nick: str, account: str | None
+    ) -> list[Any]:
+        """Pending tells this person left in this channel, oldest first.
+        Identity is from_key, so it follows their account across nick
+        changes rather than being defeated by one."""
+        return await self.db.fetchall(
+            "SELECT * FROM tells "
+            "WHERE channel = ? AND from_key = ? "
+            "AND delivered_at IS NULL AND expires_at > ? "
+            "ORDER BY created_at ASC, id ASC",
+            (channel, actor_key(nick, account), now_utc_iso()),
+        )
+
+    async def cancel(
+        self,
+        tell_id: int,
+        actor_nick: str,
+        actor_account: str | None,
+        is_operator: bool,
+    ) -> TellResult:
+        """Withdraw a tell before it is delivered. You may cancel your own;
+        operators may cancel any. Already-delivered tells cannot be
+        cancelled — that message is out, and pretending otherwise would be
+        worse than saying so."""
+        row = await self.db.fetchone(
+            "SELECT * FROM tells WHERE id = ?", (tell_id,)
+        )
+        if row is None or row["delivered_at"] is not None:
+            return TellResult(False, f"(no pending tell #{tell_id})")
+
+        if not is_operator and row["from_key"] != actor_key(actor_nick, actor_account):
+            log.info(
+                "!untell refused: %s is not the owner of tell #%d",
+                actor_nick, tell_id,
+            )
+            return TellResult(False, f"(tell #{tell_id} isn't yours to cancel)")
+
+        await self.db.execute("DELETE FROM tells WHERE id = ?", (tell_id,))
+        await self.db.log_audit(
+            action="tell.cancel",
+            channel=row["channel"],
+            actor_nick=actor_nick,
+            actor_account=actor_account,
+            details={"tell_id": tell_id, "to_nick": row["to_nick"],
+                     "by_operator": is_operator},
+        )
+        return TellResult(
+            True, f"cancelled tell #{tell_id} for {row['to_nick']}."
+        )
+
+    async def prune(self) -> int:
+        """Retention sweep: drop tells delivered more than TELL_EXPIRY_DAYS
+        ago, and undelivered ones past their expiry. Returns rows removed.
+
+        A hard DELETE here, unlike delivery's soft delete: the soft delete
+        exists so a recently-relayed message is still inspectable, and
+        after a month that value has run out."""
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=TELL_EXPIRY_DAYS)
+        ).isoformat()
+        now = now_utc_iso()
+        try:
+            # Direct sqlite execution so we can read cur.rowcount; the
+            # db.execute wrapper doesn't expose it. Same pattern and same
+            # reason as Scheduler._prune_old_reminders.
+            async with self.db.conn.execute(
+                "DELETE FROM tells "
+                "WHERE (delivered_at IS NOT NULL AND delivered_at < ?) "
+                "   OR (delivered_at IS NULL AND expires_at < ?)",
+                (cutoff, now),
+            ) as cur:
+                removed = cur.rowcount or 0
+            await self.db.conn.commit()
+            if removed:
+                log.info("Pruned %d expired/delivered tell(s)", removed)
+            return removed
+        except Exception:
+            log.exception("tell retention prune failed")
+            return 0
+
     @staticmethod
     def _clean_target_nick(raw: str) -> str | None:
         """Strip channel prefixes and whitespace, then validate the shape.

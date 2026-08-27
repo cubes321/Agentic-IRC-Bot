@@ -114,6 +114,7 @@ class Scheduler:
         chat_semaphore: asyncio.Semaphore | None,
         memory: Any,                # MemoryStore | None
         ircbot: Any,                # IRCBot — used for posting and reading channel state
+        tells: Any = None,          # bot.tells.TellStore | None
     ):
         self.cfg = cfg
         self.db = db
@@ -122,6 +123,7 @@ class Scheduler:
         self.chat_sem = chat_semaphore
         self.memory = memory
         self.bot = ircbot
+        self.tells = tells
         self._tasks: list[asyncio.Task] = []
         self._stopping = asyncio.Event()
 
@@ -399,19 +401,25 @@ class Scheduler:
                 for channel, ch_rows in by_channel.items():
                     await self._fire_channel_batch(channel, ch_rows)
 
-                # Periodic housekeeping. Three independent maintenance
+                # Periodic housekeeping. Four independent maintenance
                 # tasks share the same hourly trigger:
                 #   - prune old reminders (orphans + failed-fire cleanup, H3)
                 #   - prune old message_log rows (retention from
                 #     [storage].message_log_retention_days, L2)
                 #   - refresh per-channel op state (defensive against
                 #     missed mode events around netsplits, M5)
-                # All three are cheap enough that one hourly cycle
+                #   - prune delivered/expired tells
+                # All four are cheap enough that one hourly cycle
                 # handles them with no dedicated coroutines.
                 if time.monotonic() - last_prune > self.REMINDER_PRUNE_INTERVAL_SEC:
                     await self._prune_old_reminders()
                     await self._prune_old_messages()
                     await self._refresh_channel_op_state()
+                    if self.tells is not None:
+                        try:
+                            await self.tells.prune()
+                        except Exception:
+                            log.exception("tell prune failed")
                     last_prune = time.monotonic()
 
                 # Sleep but wake early if stop is signalled.
