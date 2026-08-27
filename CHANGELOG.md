@@ -81,6 +81,10 @@ breaking changes freely until a `1.0.0` release).
     point of the fire-cap (H3) rather than a consequence of a
     successful send — the excess must be dropped whether or not the
     notice reaches the channel, otherwise it re-fires next cycle.
+    `tells.deliver` already keys its delivered_at write off the return
+    value; its "+N more" overflow notice ignores it, but the
+    overflowed rows are left pending either way, so a failed notice
+    costs nothing but the hint.
 - Task results no longer flood the channel hard enough to trigger
   IRC excess-flood disconnects. A verbose multi-paragraph task answer
   (30+ wire lines after wrap) was observed killing the bot's
