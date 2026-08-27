@@ -163,3 +163,94 @@ async def test_create_refused_when_allow_tell_false(tmp_path):
         assert "disabled" in r.message.lower()
     finally:
         await database.close()
+
+
+from bot.tells import (
+    TELL_MAX_PENDING_PER_PAIR,
+    TELL_MAX_PENDING_PER_RECIPIENT,
+    TELL_RATE_LIMIT,
+)
+
+
+async def _leave(store, to="dave", frm="alice", account=None, channel="#test"):
+    return await store.create(
+        channel=channel, from_nick=frm, from_account=account,
+        to_nick=to, to_account=None, message="hi", bot_nick="TestBot",
+    )
+
+
+async def test_hourly_rate_limit_allows_up_to_the_cap(store):
+    # Each goes to a different recipient so only the hourly cap can bite.
+    for i in range(TELL_RATE_LIMIT):
+        r = await _leave(store, to=f"dave{i}")
+        assert r.ok is True, f"create #{i + 1} should have been allowed"
+
+
+async def test_hourly_rate_limit_refuses_past_the_cap(store):
+    for i in range(TELL_RATE_LIMIT):
+        await _leave(store, to=f"dave{i}")
+    r = await _leave(store, to="someone-else")
+    assert r.ok is False
+    assert "rate limit" in r.message.lower()
+
+
+async def test_rate_limit_is_per_actor(store):
+    for i in range(TELL_RATE_LIMIT):
+        await _leave(store, to=f"dave{i}", frm="alice")
+    # A different person still has their own budget.
+    r = await _leave(store, to="dave", frm="bob")
+    assert r.ok is True
+
+
+async def test_pending_per_pair_cap(store):
+    # TELL_RATE_LIMIT and TELL_MAX_PENDING_PER_PAIR are both 5, but create()
+    # checks the pair cap BEFORE the hourly one, so the 6th is refused for
+    # the pair reason. Asserting on the message is what pins that ordering.
+    for i in range(TELL_MAX_PENDING_PER_PAIR):
+        r = await _leave(store, to="dave")
+        assert r.ok is True, f"pair create #{i + 1} should have been allowed"
+    r = await _leave(store, to="dave")
+    assert r.ok is False
+    assert "already" in r.message.lower()
+
+
+async def test_pending_per_pair_cap_is_per_recipient(store, monkeypatch):
+    # Lift the hourly cap so only the pair cap can bite. Patching the module
+    # constant beats reaching into store._rate_history: it touches no
+    # privates and reads as what it is.
+    monkeypatch.setattr("bot.tells.TELL_RATE_LIMIT", 100)
+    for _ in range(TELL_MAX_PENDING_PER_PAIR):
+        await _leave(store, to="dave")
+    r = await _leave(store, to="erin")   # different recipient, fresh pair
+    assert r.ok is True
+
+
+async def test_pending_per_recipient_cap_across_senders(store):
+    # Fill dave's inbox from enough distinct senders to exceed the
+    # per-recipient cap without any one of them hitting the pair cap.
+    # Each sender has their own hourly budget, so no patching is needed.
+    senders = [f"sender{i}" for i in range(4)]
+    made = 0
+    for s in senders:
+        for _ in range(TELL_MAX_PENDING_PER_PAIR):
+            r = await _leave(store, to="dave", frm=s)
+            if r.ok:
+                made += 1
+            else:
+                assert "too many" in r.message.lower()
+                assert made == TELL_MAX_PENDING_PER_RECIPIENT
+                return
+    pytest.fail(f"per-recipient cap never fired (made {made})")
+
+
+async def test_delivered_tells_do_not_count_against_caps(store, monkeypatch):
+    monkeypatch.setattr("bot.tells.TELL_RATE_LIMIT", 100)
+    for _ in range(TELL_MAX_PENDING_PER_PAIR):
+        await _leave(store, to="dave")
+    # Mark them all delivered; the pair budget should free up.
+    await store.db.execute(
+        "UPDATE tells SET delivered_at = ? WHERE delivered_at IS NULL",
+        ("2026-08-27T00:00:00+00:00",),
+    )
+    r = await _leave(store, to="dave")
+    assert r.ok is True

@@ -41,6 +41,22 @@ TELL_MAX_MESSAGE_LEN = 400
 # another season.
 TELL_EXPIRY_DAYS = 30
 
+# How fast one person may create tells. In-memory, so it resets on restart
+# — the same trade-off set_reminder documents, and acceptable here for the
+# same reason: it throttles bursts, it is not the load-bearing protection.
+TELL_RATE_LIMIT = 5
+TELL_RATE_WINDOW_SEC = 3600.0
+# Periodic cleanup of _rate_history so it can't grow without bound over a
+# long uptime (the L4 sweep pattern from irc_native.py).
+TELL_SWEEP_INTERVAL_SEC = 3600.0
+
+# The load-bearing anti-harassment limits, and the reason they are DB-backed
+# rather than in-memory: these are what stand between a user and a queue of
+# unwanted messages from someone else, so they must survive a restart.
+# Both count PENDING rows only — delivered tells free the budget up again.
+TELL_MAX_PENDING_PER_PAIR = 5        # from one sender to one recipient
+TELL_MAX_PENDING_PER_RECIPIENT = 15  # at one recipient, all senders combined
+
 # RFC 2812 nick shape: a letter or one of the "special" characters first,
 # then letters, digits, specials, or '-'. Without this check,
 # `!tell hi there everyone` silently files a tell for a user named "hi".
@@ -124,6 +140,37 @@ class TellStore:
         if truncated:
             body = body[:TELL_MAX_MESSAGE_LEN]
 
+        # Durable caps first, then the in-memory rate limit. Order matters:
+        # a refusal that costs the caller a slice of their hourly budget
+        # would let a griefer burn someone else's budget by targeting a
+        # recipient whose queue is already full.
+        from_key = actor_key(from_nick, from_account)
+        target_lower = target.lower()
+
+        pair_pending = await self._count_pending(channel, target_lower, from_key)
+        if pair_pending >= TELL_MAX_PENDING_PER_PAIR:
+            return TellResult(
+                False,
+                f"(you already have {pair_pending} message(s) waiting for "
+                f"{target} here — use !untell to clear one first)",
+            )
+
+        total_pending = await self._count_pending(channel, target_lower, None)
+        if total_pending >= TELL_MAX_PENDING_PER_RECIPIENT:
+            return TellResult(
+                False,
+                f"(too many messages already waiting for {target} here; "
+                f"try again once they've picked some up)",
+            )
+
+        allowed, remaining = await self._check_rate(from_key)
+        if not allowed:
+            log.info("tell rate-limited for %s in %s", from_key, channel)
+            return TellResult(
+                False,
+                f"(rate limit: {TELL_RATE_LIMIT} tells an hour. Try later.)",
+            )
+
         now = datetime.now(timezone.utc)
         expires = now + timedelta(days=TELL_EXPIRY_DAYS)
         tell_id = await self.db.insert_returning_id(
@@ -147,7 +194,7 @@ class TellStore:
             details={"tell_id": tell_id, "to_nick": target, "chars": len(body)},
         )
 
-        note = " (truncated to 400 chars)" if truncated else ""
+        note = f" (truncated to {TELL_MAX_MESSAGE_LEN} chars)" if truncated else ""
         return TellResult(
             True,
             f"ok — I'll tell {target} when they're next around{note}. "
@@ -156,6 +203,50 @@ class TellStore:
         )
 
     # ---- helpers ----
+
+    async def _check_rate(self, key: str) -> tuple[bool, int]:
+        """Sliding-window rate check for one actor. Returns
+        (allowed, remaining_in_window)."""
+        async with self._rate_lock:
+            now = time.monotonic()
+            # Periodic sweep: drop actors whose whole history has aged out.
+            if now - self._rate_last_sweep > TELL_SWEEP_INTERVAL_SEC:
+                cutoff = now - TELL_RATE_WINDOW_SEC
+                stale = [
+                    k for k, v in self._rate_history.items()
+                    if not v or max(v) < cutoff
+                ]
+                for k in stale:
+                    del self._rate_history[k]
+                if stale:
+                    log.debug("tell rate sweep: dropped %d stale key(s)", len(stale))
+                self._rate_last_sweep = now
+
+            window_start = now - TELL_RATE_WINDOW_SEC
+            fresh = [t for t in self._rate_history.get(key, []) if t >= window_start]
+            if len(fresh) >= TELL_RATE_LIMIT:
+                self._rate_history[key] = fresh   # keep the pruned state
+                return False, 0
+            fresh.append(now)
+            self._rate_history[key] = fresh
+            return True, TELL_RATE_LIMIT - len(fresh)
+
+    async def _count_pending(
+        self, channel: str, to_nick_lower: str, from_key: str | None
+    ) -> int:
+        """Pending, unexpired tells for a recipient in a channel. With
+        `from_key`, narrowed to those from one sender."""
+        params: list[Any] = [channel, to_nick_lower, now_utc_iso()]
+        sql = (
+            "SELECT COUNT(*) AS n FROM tells "
+            "WHERE channel = ? AND to_nick_lower = ? "
+            "AND delivered_at IS NULL AND expires_at > ?"
+        )
+        if from_key is not None:
+            sql += " AND from_key = ?"
+            params.append(from_key)
+        row = await self.db.fetchone(sql, params)
+        return int(row["n"]) if row else 0
 
     @staticmethod
     def _clean_target_nick(raw: str) -> str | None:
