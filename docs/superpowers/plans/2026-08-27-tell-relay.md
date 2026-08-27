@@ -936,7 +936,10 @@ async def test_pending_for_ignores_unrelated_people(store):
 
 async def test_pending_for_does_not_match_null_account(store):
     # A tell with to_account NULL must not match everyone who arrives
-    # without an account. Guards a NULL-comparison mistake in the WHERE.
+    # without an account. Pins the no-cross-user-leak behaviour itself.
+    # (Note: this passes with or without the explicit IS NOT NULL guard in
+    # the WHERE — SQL's `= NULL` is already never true. It pins the
+    # outcome that matters, not the guard's presence.)
     await _leave(store, to="dave")
     assert await store.pending_for("#test", "erin", None) == []
 
@@ -997,10 +1000,16 @@ Add to `TellStore` in `bot/tells.py`, after `_count_pending`:
         the tell was left. The second arm is what catches `dave` coming
         back as `dave_`.
 
-        The `to_account IS NOT NULL` guard is load-bearing. Without it, an
-        arriving user with no account (account = None) would match every
-        tell whose to_account is also NULL — i.e. the first person to speak
-        would collect everyone's messages."""
+        The `to_account IS NOT NULL` guard is defence-in-depth, not
+        load-bearing today: SQL's three-valued logic already makes
+        `to_account = ?` yield NULL (not true) whenever either side is
+        NULL, so an accountless arrival cannot collect NULL-account tells
+        even without it. It is kept because that protection is a property
+        of the comparison operator rather than of this code — an edit that
+        switched to `IS`, or moved the match into Python where
+        `None == None` is True, would silently turn this into a
+        cross-user message leak. The guard makes the requirement explicit
+        at the site that depends on it."""
         return await self.db.fetchall(
             "SELECT * FROM tells "
             "WHERE channel = ? AND delivered_at IS NULL AND expires_at > ? "
