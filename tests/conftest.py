@@ -30,3 +30,11 @@ async def db(tmp_path):
 @pytest.fixture
 def cfg() -> Config:
     return make_cfg(**{"#test": ChannelCfg()})
+
+
+@pytest.fixture
+async def store(db, cfg):
+    """A TellStore over a fresh temp DB. Rate-limit state is per-instance,
+    so every test starts with a clean budget."""
+    from bot.tells import TellStore
+    return TellStore(db=db, cfg=cfg)

@@ -318,7 +318,11 @@ async def test_create_stores_normalised_fields(store: TellStore):
     assert row["delivered_at"] is None
 
 
-@pytest.mark.parametrize("bad", ["", "   ", "#geeks", "!!!", "9lives", "a" * 40])
+# NB: "#geeks" is deliberately NOT in this list. Channel prefixes are
+# stripped BEFORE validation (spec step 1, the L5 fix), so "#geeks"
+# becomes the valid nick "geeks" and is accepted — see
+# test_create_strips_channel_prefix_then_validates below.
+@pytest.mark.parametrize("bad", ["", "   ", "#", "!!!", "9lives", "a" * 40])
 async def test_create_rejects_bad_target_nicks(store: TellStore, bad: str):
     r = await store.create(
         channel="#test", from_nick="alice", from_account=None,
