@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from bot.db import Database
@@ -254,3 +256,23 @@ async def test_delivered_tells_do_not_count_against_caps(store, monkeypatch):
     )
     r = await _leave(store, to="dave")
     assert r.ok is True
+
+
+async def test_concurrent_create_cannot_exceed_pair_cap(store, monkeypatch):
+    """TOCTOU guard. create() counts pending rows and then inserts, with
+    awaits in between; ircclient dispatches command handlers via
+    create_task, so two !tell calls really can interleave there. Without
+    _create_lock several of these gathered calls all see the same
+    below-cap count and all insert."""
+    monkeypatch.setattr("bot.tells.TELL_RATE_LIMIT", 100)
+    for _ in range(TELL_MAX_PENDING_PER_PAIR - 1):
+        await _leave(store, to="dave")
+
+    results = await asyncio.gather(*[_leave(store, to="dave") for _ in range(5)])
+
+    assert sum(1 for r in results if r.ok) == 1, "exactly one should win the last slot"
+    rows = await store.db.fetchall(
+        "SELECT id FROM tells "
+        "WHERE to_nick_lower = 'dave' AND delivered_at IS NULL"
+    )
+    assert len(rows) == TELL_MAX_PENDING_PER_PAIR
