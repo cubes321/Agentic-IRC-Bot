@@ -95,3 +95,4 @@ from . import log_search    # noqa: E402,F401
 from . import vision        # noqa: E402,F401  (gated by requires={"vision"})
 from . import memory_tools  # noqa: E402,F401  (Tier-4: recall/remember/forget/set_reminder)
 from . import irc_native    # noqa: E402,F401  (Tier-5: me_action/set_topic/private_msg)
+from . import tell           # noqa: E402,F401  (Tier-4: leave_message)
