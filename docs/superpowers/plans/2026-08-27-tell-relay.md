@@ -2081,3 +2081,18 @@ Run against a live IRC server before calling this done. These paths have no auto
 - [ ] Leave a tell in `#a`; the recipient's activity in `#b` does NOT deliver it
 - [ ] Restart the bot with a pending tell → still delivered afterwards
 - [ ] `sqlite3 bot.sqlite "SELECT action, details FROM audit WHERE action LIKE 'tell%'"` shows create/deliver/cancel rows
+
+Added after Task 8's review, which pointed out these command paths have no
+automated cover at all — the handlers need a live pydle, so a live run is
+the only thing that exercises them:
+
+- [ ] Bare `!untell` (no id) → usage hint, not a crash
+- [ ] `!untell abc` (non-numeric id) → usage hint, not a crash
+- [ ] `!untell <id>` on someone else's tell: refused for a non-operator, allowed for an operator
+- [ ] `!tells` with nothing pending → "no tells waiting from you here."
+- [ ] Fire several `!tell`s quickly → the rate-limit message surfaces cleanly, not garbled or doubled
+- [ ] A near-miss like `!tellx foo` → treated as ordinary chat, not swallowed and not an error
+- [ ] `!tells` on a fresh tell → `human_age` renders "just now" (first live exercise of that path)
+- [ ] Start the bot at least once. Nothing automated executes `main.run()`, so a wrong keyword
+      argument to `TellStore(...)` or `Scheduler(...)` would pass both pytest and an import check
+      and only surface here.
