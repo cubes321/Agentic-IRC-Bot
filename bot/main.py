@@ -39,6 +39,7 @@ from .ircclient import IRCBot
 from .memory import MemoryStore, MemoryWriter
 from .scheduler import Scheduler
 from .tasks import TaskRunner
+from .tells import TellStore
 # Importing tools triggers self-registration into the registry.
 from . import tools  # noqa: F401
 
@@ -349,6 +350,12 @@ async def run(cfg: Config, shutdown_event: asyncio.Event) -> None:
         shutdown_event=shutdown_event,
     )
 
+    # TellStore owns the !tell relay. Constructed after the IRCBot for the
+    # same reason TaskRunner is — delivery posts through the bot — and
+    # assigned back by attribute.
+    tell_store = TellStore(db=db, cfg=cfg)
+    client.tell_store = tell_store
+
     # Scheduler runs the long-lived background loops (initiative ticks,
     # reminder firing). Constructed here, started AFTER the IRC connection
     # is up, stopped during shutdown.
@@ -359,6 +366,7 @@ async def run(cfg: Config, shutdown_event: asyncio.Event) -> None:
         chat_model=cfg.ai.chat_model,
         chat_semaphore=chat_sem,
         memory=memory,
+        tells=tell_store,
         ircbot=client,
     )
 

@@ -53,6 +53,7 @@ class IRCBot(pydle.Client):
         memory_writer: MemoryWriter | None = None,
         shutdown_event: asyncio.Event | None = None,
         task_runner: Any = None,           # bot.tasks.TaskRunner (untyped to avoid cycle)
+        tell_store: Any = None,            # bot.tells.TellStore (untyped to avoid cycle)
         **kwargs: Any,
     ):
         super().__init__(nickname=nickname, realname=realname, **kwargs)
@@ -68,6 +69,10 @@ class IRCBot(pydle.Client):
         # dispatch !task commands). Set via `bot.task_runner = ...` post-init.
         # None until then; command handlers gracefully refuse if so.
         self.task_runner = task_runner
+        # TellStore owns the !tell / !tells / !untell lifecycle and the
+        # presence-triggered delivery. Like task_runner it may be assigned
+        # after construction; handlers refuse gracefully while it is None.
+        self.tell_store = tell_store
         # Shared shutdown signal: set by !quit, signal handlers, or main loop
         # exit. Checked by on_message to refuse new engagements once set. Main
         # waits on this event to know when to begin tear-down.
@@ -166,6 +171,8 @@ class IRCBot(pydle.Client):
         if user == self.nickname:
             log.info("Joined %s", channel)
             return
+        # Someone else arrived — they may have messages waiting.
+        asyncio.create_task(self._maybe_deliver_tells(channel, user))
 
     async def on_part(self, channel: str, user: str, message: str | None = None) -> None:
         await super().on_part(channel, user, message)
@@ -263,6 +270,11 @@ class IRCBot(pydle.Client):
             await self.db.log_message(target, source, account, message)
             if self.memory_writer is not None:
                 self.memory_writer.note_message(target)
+            # Presence trigger: they spoke, so they're here and reading.
+            # Covers the case a join-only trigger misses entirely — someone
+            # who was already sitting in the channel, idle, when the tell
+            # was left.
+            asyncio.create_task(self._maybe_deliver_tells(target, source))
 
         # For command dispatch, strip a leading bot-nick mention so commands
         # work whether typed bare ("!task X") or addressed to the bot
@@ -398,6 +410,10 @@ class IRCBot(pydle.Client):
             await self.db.log_message(target, by, account, formatted)
             if self.memory_writer is not None:
                 self.memory_writer.note_message(target)
+            # A /me is activity too. Pydle routes actions here and never
+            # through on_message, so without this an emoting user would
+            # never trigger delivery.
+            asyncio.create_task(self._maybe_deliver_tells(target, by))
 
         # Shutdown gate. Actions don't carry !quit (CTCP wrapper would have
         # been processed differently), so no operator-command branch here.
@@ -685,6 +701,24 @@ class IRCBot(pydle.Client):
         line2 = f"Oldest: {oldest}, newest: {newest}; top: {top_str}"
         await self.irc_send(channel, line1)
         await self.irc_send(channel, line2)
+
+    # ---- tell relay ----
+
+    async def _maybe_deliver_tells(self, channel: str, nick: str) -> None:
+        """Hand over any messages waiting for `nick` in `channel`.
+
+        Called from three presence hooks (join / message / action). Cheap
+        when there is nothing pending: one indexed SELECT that returns no
+        rows. Swallows every exception — this runs off the back of routine
+        IRC events, and a tell-relay bug must never be able to break
+        on_join or on_message."""
+        if self.tell_store is None or nick == self.nickname:
+            return
+        try:
+            account = self._cached_account_or_none(nick)
+            await self.tell_store.deliver(self, channel, nick, account)
+        except Exception:
+            log.exception("tell delivery failed for %s in %s", nick, channel)
 
     # ---- helpers ----
 
