@@ -578,10 +578,24 @@ class Scheduler:
             return
 
         text = f"reminder for {target}: {message}" if target else f"reminder: {message}"
+        # irc_send does NOT raise on a wire failure — it catches its own
+        # exceptions, logs, and returns the count sent up to the failure
+        # (see IRCBot.irc_send). So the `except` below is a belt-and-braces
+        # guard that in practice never fires, and the return value is the
+        # real signal: 0 lines sent means the reminder never reached the
+        # channel and the row must survive for the next poll to retry.
+        # Deleting on a 0 return silently loses the reminder entirely.
+        # (`text` always carries the "reminder..." prefix, so it is never
+        # empty — the other case where irc_send legitimately returns 0.)
         try:
-            await self.bot.irc_send(channel, text)
+            sent = await self.bot.irc_send(channel, text)
         except Exception:
             log.exception("failed to post reminder #%d to %s; will retry", rid, channel)
+            return
+        if not sent:
+            log.warning(
+                "reminder #%d: irc_send posted 0 lines to %s; will retry", rid, channel
+            )
             return
 
         try:

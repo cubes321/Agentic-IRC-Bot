@@ -948,6 +948,14 @@ class IRCBot(pydle.Client):
         on a verbose multi-paragraph task answer. Returning 0 is normal
         for empty / whitespace-only input.
 
+        CAUTION for callers that act on the outcome: this method does
+        NOT raise on a wire failure (see "Failure mode" below), so
+        wrapping the call in try/except is not enough to detect one.
+        If you delete a row, set a delivered flag, write an audit
+        record, or report success on the strength of a successful
+        send, you MUST check the return value — for non-empty `text`,
+        0 means nothing reached the wire.
+
         Behaviour:
         - Splits `text` on newlines; empty / whitespace-only lines are dropped.
         - Each remaining line is sanitised (control chars stripped, ends

@@ -46,6 +46,22 @@ breaking changes freely until a `1.0.0` release).
   makes it testable without a live pydle.
 
 ### Fixed
+- Reminders are no longer silently lost when the IRC connection drops
+  mid-send. `IRCBot.irc_send` deliberately does not raise on a wire
+  failure — it logs and returns the count of lines sent up to the
+  failure — so a caller using `try`/`except` as its failure gate has a
+  retry branch that can never run:
+  - `scheduler._fire_reminder` posted the reminder and then deleted
+    its row. On a dropped connection `irc_send` returned 0, the
+    `except` was skipped, and the row was deleted for a reminder the
+    channel never saw. It now treats a 0 return as a failed post and
+    leaves the row for the next poll cycle to retry.
+  - `IRCBot.irc_send`'s docstring now carries an explicit caution for
+    callers that take an irreversible action on a successful send.
+    The earlier note that returning `int` instead of `None` was
+    "invisible to existing callers" was true for compatibility and
+    misleading for safety: ignoring the return value is what made the
+    bug possible.
 - Task results no longer flood the channel hard enough to trigger
   IRC excess-flood disconnects. A verbose multi-paragraph task answer
   (30+ wire lines after wrap) was observed killing the bot's
