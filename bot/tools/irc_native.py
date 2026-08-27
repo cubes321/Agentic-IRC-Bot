@@ -386,11 +386,23 @@ async def _private_msg(ctx: ToolContext, args: dict) -> dict:
 
     # Reuse the bot's irc_send so DMs get the same sanitisation, line-splitting,
     # MAX_LINES_PER_REPLY cap, and INTER_LINE_DELAY pacing as channel replies.
+    #
+    # irc_send does NOT raise on a wire failure — it catches its own
+    # exceptions, logs, and returns the count sent (see IRCBot.irc_send).
+    # So the `except` below is a belt-and-braces guard that in practice
+    # never fires, and the return value is the real signal. Treating 0 as
+    # success meant we wrote an audit row for a DM that never left the bot
+    # and told the model "sent": True, so it would go on to tell the
+    # channel the message had been delivered. (`text` is non-empty by the
+    # check above, so 0 here can only mean a failed send.)
     try:
-        await ctx.bot.irc_send(target, text)
+        sent = await ctx.bot.irc_send(target, text)
     except Exception as e:
         log.exception("private_msg send to %s failed", target)
         return {"error": f"send failed: {e}"}
+    if not sent:
+        log.warning("private_msg: irc_send posted 0 lines to %s", target)
+        return {"error": f"send failed: no lines reached {target}"}
 
     log.info(
         "private_msg to %s (from %s in %s): %r",

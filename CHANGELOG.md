@@ -46,11 +46,11 @@ breaking changes freely until a `1.0.0` release).
   makes it testable without a live pydle.
 
 ### Fixed
-- Reminders are no longer silently lost when the IRC connection drops
-  mid-send. `IRCBot.irc_send` deliberately does not raise on a wire
-  failure — it logs and returns the count of lines sent up to the
-  failure — so a caller using `try`/`except` as its failure gate has a
-  retry branch that can never run:
+- Reminders and DMs are no longer silently lost when the IRC
+  connection drops mid-send. `IRCBot.irc_send` deliberately does not
+  raise on a wire failure — it logs and returns the count of lines
+  sent up to the failure — so callers using `try`/`except` as their
+  failure gate had a retry branch that could never run:
   - `scheduler._fire_reminder` posted the reminder and then deleted
     its row. On a dropped connection `irc_send` returned 0, the
     `except` was skipped, and the row was deleted for a reminder the
@@ -61,7 +61,26 @@ breaking changes freely until a `1.0.0` release).
     The earlier note that returning `int` instead of `None` was
     "invisible to existing callers" was true for compatibility and
     misleading for safety: ignoring the return value is what made the
-    bug possible.
+    bugs possible.
+  - `tools.irc_native.private_msg` wrote an `audit` row and returned
+    `{"sent": True}` to the model on the same false signal, so the bot
+    would go on to tell the channel it had DMed someone when nothing
+    left the wire. A forensic record of a DM that never happened is
+    worse than no record at all (the `audit` table exists for exactly
+    this class of Tier-5 action, security review M3). It now returns
+    an error and writes no audit row. Note the per-target DM rate
+    budget is still consumed by a failed send — it is claimed before
+    the send and is not refunded.
+  - Audited every other `irc_send` call site; no further instances.
+    Ticks, goodbyes and command replies are best-effort posts with no
+    follow-on state change. `tasks._post_result` already consumes the
+    return value for its line budget, and `_persist_outcome` writes
+    the full result to the DB *before* it posts, so a failed post
+    loses nothing. `scheduler._fire_channel_batch` does delete rows
+    after posting its flood-control notice, but those deletes are the
+    point of the fire-cap (H3) rather than a consequence of a
+    successful send — the excess must be dropped whether or not the
+    notice reaches the channel, otherwise it re-fires next cycle.
 - Task results no longer flood the channel hard enough to trigger
   IRC excess-flood disconnects. A verbose multi-paragraph task answer
   (30+ wire lines after wrap) was observed killing the bot's
