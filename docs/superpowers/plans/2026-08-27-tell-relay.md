@@ -1225,7 +1225,6 @@ Add to `TellStore` in `bot/tells.py`, after `pending_for`:
                 return 0
 
             batch = rows[:TELL_MAX_DELIVER_PER_ARRIVAL]
-            overflow = len(rows) - len(batch)
             delivered = 0
 
             for row in batch:
@@ -1233,11 +1232,25 @@ Add to `TellStore` in `bot/tells.py`, after `pending_for`:
                     f"{nick}: [from {row['from_nick']}, "
                     f"{human_age(row['created_at'])}] {row['message']}"
                 )
+                # irc_send does NOT raise on a wire failure — it catches
+                # internally and returns the count actually sent (see its
+                # docstring in ircclient.py). So the return value, not an
+                # exception, is what tells us the line went out. Treating a
+                # 0 as success here would mark the tell delivered having
+                # posted nothing: the exact silent loss this method's
+                # retry behaviour exists to prevent. The except is kept as
+                # well, in case a future irc_send does raise.
                 try:
-                    await bot.irc_send(channel, line)
+                    sent = await bot.irc_send(channel, line)
                 except Exception:
                     log.exception(
                         "tell #%s: send failed, leaving pending", row["id"]
+                    )
+                    break
+                if not sent:
+                    log.warning(
+                        "tell #%s: irc_send posted 0 lines, leaving pending",
+                        row["id"],
                     )
                     break
                 try:
@@ -1263,6 +1276,12 @@ Add to `TellStore` in `bot/tells.py`, after `pending_for`:
                     details={"tell_id": row["id"], "to_nick": nick},
                 )
 
+            # Computed AFTER the loop, not before it. Anything still
+            # pending counts as "more" — whether it was beyond the
+            # per-arrival cap, or was in the batch but did not get sent.
+            # Deriving it from the batch slice up front would understate
+            # the remainder whenever a send failed mid-batch.
+            overflow = len(rows) - delivered
             if delivered and overflow:
                 try:
                     await bot.irc_send(
