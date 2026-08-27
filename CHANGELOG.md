@@ -41,9 +41,11 @@ breaking changes freely until a `1.0.0` release).
   - Per-channel `allow_tell` (default on) gates *creation only* —
     switching it off cannot strand messages someone already left.
 - **First test suite** — `pytest` + `pytest-asyncio`, covering
-  `TellStore` against a temporary SQLite file (72 tests). `TellStore` is
-  pure logic over the database with no IRC dependency, which is what
-  makes it testable without a live pydle.
+  `TellStore` against a temporary SQLite file, plus reminder firing and
+  the `private_msg` tool (80 tests). `TellStore` is pure logic over the
+  database with no IRC dependency, which is what makes it testable
+  without a live pydle; the other two are reached with a fake bot whose
+  `irc_send` mirrors the real one's return-value contract.
 
 ### Fixed
 - Reminders and DMs are no longer silently lost when the IRC
@@ -84,7 +86,10 @@ breaking changes freely until a `1.0.0` release).
     `tells.deliver` already keys its delivered_at write off the return
     value; its "+N more" overflow notice ignores it, but the
     overflowed rows are left pending either way, so a failed notice
-    costs nothing but the hint.
+    costs nothing but the hint. `!tell` and `!untell` both complete
+    their write before replying, so a failed confirmation costs the
+    acknowledgement rather than the tell, and `!tells` accumulates the
+    return value as a line budget the way `tasks._post_result` does.
 - Task results no longer flood the channel hard enough to trigger
   IRC excess-flood disconnects. A verbose multi-paragraph task answer
   (30+ wire lines after wrap) was observed killing the bot's
