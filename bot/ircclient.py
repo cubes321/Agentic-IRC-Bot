@@ -764,10 +764,13 @@ class IRCBot(pydle.Client):
         sent = 0
         for r in rows:
             if sent >= MAX_TELL_LIST_WIRE_LINES:
+                # Deliberately no count here. `rows` is already truncated to
+                # TELL_LIST_LIMIT by the store, so len(rows) is not the real
+                # remainder — quoting it would understate how many are
+                # actually waiting. Better to say "more" than a wrong number.
                 await self.irc_send(
                     channel,
-                    f"  (…{len(rows) - sent} more not shown; "
-                    f"use !untell <id> to clear some)",
+                    "  (…more not shown; use !untell <id> to clear some)",
                 )
                 break
             preview = (r["message"] or "")[:60]
