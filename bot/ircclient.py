@@ -18,6 +18,7 @@ from .config import Config
 from .db import Database
 from .memory import MemoryWriter
 from .policy import ChannelPolicy
+from .tells import human_age
 
 log = logging.getLogger(__name__)
 
@@ -324,6 +325,20 @@ class IRCBot(pydle.Client):
             return
         if not is_dm and (cmd_text == "!task" or cmd_text.startswith("!task ")):
             asyncio.create_task(self._cmd_issue_task(target, source, cmd_text))
+            return
+
+        # Tell relay. Same early-dispatch treatment as the task commands:
+        # plain commands, no mention required, no LLM turn burned. Both the
+        # bare and the with-args form are matched so "!tell" alone gets a
+        # usage hint rather than falling through to engagement.
+        if not is_dm and (cmd_text == "!tells" or cmd_text.startswith("!tells ")):
+            asyncio.create_task(self._cmd_list_tells(target, source))
+            return
+        if not is_dm and (cmd_text == "!untell" or cmd_text.startswith("!untell ")):
+            asyncio.create_task(self._cmd_untell(target, source, cmd_text))
+            return
+        if not is_dm and (cmd_text == "!tell" or cmd_text.startswith("!tell ")):
+            asyncio.create_task(self._cmd_tell(target, source, cmd_text))
             return
 
         # Engagement: channel messages need a mention; DMs need to pass the
@@ -671,6 +686,111 @@ class IRCBot(pydle.Client):
                 channel,
                 f"  #{r['id']} [{r['status']}] {ts} {r['owner_nick']}: {goal_preview}",
             )
+
+    async def _cmd_tell(self, channel: str, source: str, cmd_text: str) -> None:
+        """`!tell <nick> <message>` — leave a message for an absent user."""
+        if self.tell_store is None:
+            await self.irc_send(channel, "(tells not available — TellStore not wired)")
+            return
+
+        rest = cmd_text[len("!tell"):].strip()
+        parts = rest.split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            await self.irc_send(
+                channel,
+                "Usage: !tell <nick> <message>  "
+                "(delivered publicly here when they're next around)",
+            )
+            return
+        to_nick, body = parts[0], parts[1].strip()
+
+        # Resolve the sender's account so the rate limit and !untell
+        # ownership follow them across nick changes.
+        await self._ensure_account_known(source)
+        from_account = self._cached_account_or_none(source)
+        # Opportunistically resolve the TARGET's account too. If they're
+        # around (or were recently), this is what lets the tell still find
+        # them when they come back as "dave_". A miss is fine and common —
+        # we fall back to nick matching. Deliberately no WHOIS here: the
+        # target is usually offline, and WHOIS on an absent nick just
+        # returns 401.
+        to_account = self._cached_account_or_none(to_nick)
+
+        try:
+            result = await self.tell_store.create(
+                channel=channel,
+                from_nick=source,
+                from_account=from_account,
+                to_nick=to_nick,
+                to_account=to_account,
+                message=body,
+                bot_nick=self.nickname,
+            )
+        except Exception:
+            log.exception("tell create failed in %s", channel)
+            await self.irc_send(channel, "(failed to store that tell; see logs)")
+            return
+
+        await self.irc_send(channel, f"{source}: {result.message}")
+
+    async def _cmd_list_tells(self, channel: str, source: str) -> None:
+        """`!tells` — list the pending tells you left in this channel."""
+        if self.tell_store is None:
+            await self.irc_send(channel, "(tells not available — TellStore not wired)")
+            return
+
+        await self._ensure_account_known(source)
+        account = self._cached_account_or_none(source)
+        try:
+            rows = await self.tell_store.list_from(channel, source, account)
+        except Exception:
+            log.exception("list_from failed for %s in %s", source, channel)
+            await self.irc_send(channel, "(failed to list tells; see logs)")
+            return
+
+        if not rows:
+            await self.irc_send(channel, f"{source}: no tells waiting from you here.")
+            return
+
+        for r in rows:
+            preview = (r["message"] or "")[:60]
+            if len(r["message"] or "") > 60:
+                preview += "…"
+            await self.irc_send(
+                channel,
+                f"  #{r['id']} -> {r['to_nick']} ({human_age(r['created_at'])}): {preview}",
+            )
+
+    async def _cmd_untell(self, channel: str, source: str, cmd_text: str) -> None:
+        """`!untell <id>` — cancel a tell you left, before it's delivered."""
+        if self.tell_store is None:
+            await self.irc_send(channel, "(tells not available — TellStore not wired)")
+            return
+
+        rest = cmd_text[len("!untell"):].strip()
+        try:
+            tell_id = int(rest)
+        except ValueError:
+            await self.irc_send(
+                channel, "Usage: !untell <id>  (the id shown by !tells)"
+            )
+            return
+
+        await self._ensure_account_known(source)
+        account = self._cached_account_or_none(source)
+        try:
+            result = await self.tell_store.cancel(
+                tell_id=tell_id,
+                actor_nick=source,
+                actor_account=account,
+                is_operator=self.auth.is_operator(account),
+            )
+        except Exception:
+            log.exception("cancel tell #%d failed", tell_id)
+            await self.irc_send(channel, "(failed to cancel; see logs)")
+            return
+
+        await self.irc_send(channel, f"{source}: {result.message}")
 
     async def _cmd_memory_stats(self, channel: str) -> None:
         """Post a quick diagnostic about this channel's memory store. Reads
