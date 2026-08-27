@@ -69,10 +69,15 @@ TELL_MAX_DELIVER_PER_ARRIVAL = 3
 # `!tell hi there everyone` silently files a tell for a user named "hi".
 NICK_RE = re.compile(r"^[A-Za-z\[\]\\`_^{|}][A-Za-z0-9\[\]\\`_^{|}\-]{0,31}$")
 
-# Channel name prefixes per RFC 2811. Stripped from a target nick before
+# Channel name prefixes per RFC 2811 — one definition, exported, because
+# two places need it and a narrower second copy is a bug waiting to happen:
+# a `+`- or `!`-prefixed channel misread as a DM would refuse a legitimate
+# tell. `bot/tools/tell.py` imports this for its is-this-a-channel check.
+CHANNEL_PREFIXES = "#&+!"
+# The lstrip variant adds whitespace. Stripped from a target nick before
 # validation — the LLM occasionally passes a channel name as the target
 # (the same failure mode set_reminder hit in security review L5).
-_CHANNEL_PREFIXES = " \t#&+!"
+_CHANNEL_PREFIXES = " \t" + CHANNEL_PREFIXES
 
 
 def actor_key(nick: str, account: str | None) -> str:

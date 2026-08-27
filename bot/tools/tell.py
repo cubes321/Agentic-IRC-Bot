@@ -8,11 +8,8 @@ place is what stops the command path and this path from drifting apart.
 
 from __future__ import annotations
 
-import logging
-
 from . import Tool, ToolContext, register
-
-log = logging.getLogger(__name__)
+from ..tells import CHANNEL_PREFIXES
 
 
 async def _leave_message(ctx: ToolContext, args: dict) -> dict:
@@ -20,7 +17,10 @@ async def _leave_message(ctx: ToolContext, args: dict) -> dict:
     store = getattr(bot, "tell_store", None) if bot is not None else None
     if store is None:
         return {"error": "the tell relay is not available"}
-    if not ctx.channel or not ctx.channel.startswith(("#", "&")):
+    # CHANNEL_PREFIXES rather than a local literal: a second, narrower copy
+    # would misread a `+`- or `!`-prefixed channel as a DM and refuse a
+    # legitimate tell.
+    if not ctx.channel or not ctx.channel.startswith(tuple(CHANNEL_PREFIXES)):
         return {"error": "tells can only be left in a channel, not in a DM"}
 
     target = (args.get("target_nick") or "").strip()
