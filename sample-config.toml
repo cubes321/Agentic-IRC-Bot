@@ -175,6 +175,10 @@ auto_recall_k = 3
 # channel sees them. Set false to disable leaving new tells in this
 # channel; any already pending are still delivered.
 allow_tell = true
+# `!define <word>` posts a deliberately wrong, pun-based dictionary
+# definition ("oxymoron (n.): a moron who breathes oxygen"). One chat-model
+# call per use, max 3 a minute per nick. Set false to ignore it here.
+allow_define = true
 
 [channels."##python"]
 mode = "quiet"

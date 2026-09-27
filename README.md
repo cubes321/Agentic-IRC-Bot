@@ -87,6 +87,14 @@ long task results, image generation, etc.).
 - Per-channel `allow_tell` (default on) disables leaving new tells;
   already-pending ones are still delivered.
 
+**Joke definitions** (`bot/define.py` + `!define`)
+- `!define <word>` posts a confidently wrong, pun-based dictionary
+  definition: `oxymoron (n.): a moron who breathes oxygen.`
+- One no-tools chat-model call per use (`AgentCore.one_shot`), usage
+  logged under purpose `define`.
+- 1–3 words, max 40 chars; 3 uses a minute per nick.
+- Per-channel `allow_define` (default on).
+
 **Background tasks** (`bot/tasks.py`)
 - `!task <goal>` schedules a multi-step background task. 30-step /
   30-minute budgets; uses the full tool catalog; cancellable via
@@ -238,6 +246,9 @@ and the token-usage summary on exit.
   call duration for the `[task #N] cancelled` line to appear.
 - **`!tasks`**: list recent tasks in the current channel (any status,
   most recent first) with id, state, age, owner, and goal preview.
+- **`!define <word>`**: a deliberately wrong, funny dictionary definition
+  of the word (3 per minute per nick; disable per channel with
+  `allow_define = false`).
 - **`!quit [parting message]`** (operator only): graceful shutdown.
   Operator status is bot-wide (account in `[operator].accounts`); channel
   ops are NOT sufficient. Sends an in-character goodbye in each active

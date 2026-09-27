@@ -10,6 +10,21 @@ breaking changes freely until a `1.0.0` release).
 ## [Unreleased]
 
 ### Added
+- **Joke definitions** — `!define <word>` answers with a confidently
+  wrong, pun-based dictionary definition, e.g. `oxymoron (n.): a moron
+  who breathes oxygen.`
+  - Generated fresh by the chat model, so it works for any word; the
+    prompt (`prompts.DEFINE_SYSTEM`) treats the word purely as data and
+    keeps the output to one PG-13 line.
+  - New `AgentCore.one_shot()` wraps the single-call pattern (shared
+    semaphore, timeout, `<think>` stripping, usage logging) that was
+    previously copied inline; `!define` is its first user. Usage is
+    attributed under purpose `define`.
+  - New `bot/define.py` owns word parsing (1–3 words, 40 chars), reply
+    cleanup (first line only, quotes stripped, 300-char cap) and an
+    in-memory rate limit of 3 per minute per nick.
+  - Early-dispatched like `!tell`, so it needs no mention and burns no
+    agent turn. Per-channel `allow_define` (default on).
 - **Tell relay** — leave a message for someone who isn't around, and the
   bot hands it over when they turn up.
   - `!tell <nick> <message>` holds a message; it is relayed publicly in

@@ -229,6 +229,40 @@ class AgentCore:
         except Exception:
             log.exception("failed to log token usage for %s", purpose)
 
+    async def one_shot(
+        self,
+        system: str,
+        user: str,
+        *,
+        purpose: str,
+        channel: str | None,
+        temperature: float = 0.9,
+    ) -> str | None:
+        """Single no-tools completion: one system prompt, one user message.
+        Shares the chat semaphore and timeout with the agent loop, strips
+        <think> blocks, logs usage under `purpose`. Returns None on any API
+        failure or an empty reply — callers decide what to say instead."""
+        model = self.cfg.ai.chat_model
+        try:
+            async with _maybe_sem(self._chat_sem):
+                resp = await self.chat.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    temperature=temperature,
+                    timeout=float(self.cfg.budgets.llm_call_timeout_sec),
+                )
+        except (APIError, APIConnectionError, asyncio.TimeoutError) as e:
+            log.warning("%s: LLM call failed: %s", purpose, e)
+            return None
+
+        await self._log_usage(resp, model, purpose, channel)
+        raw = resp.choices[0].message.content or ""
+        text, _ = _strip_thinking(raw)
+        return text or None
+
     async def run_reply_turn(
         self,
         bot: Any,        # IRCBot, kept untyped to avoid circular imports

@@ -211,6 +211,9 @@ class ChannelCfg(BaseModel):
     # pending, so turning the feature off can never strand a message
     # somebody already left. !tells and !untell keep working too.
     allow_tell: bool = True
+    # `!define <word>` — deliberately wrong, pun-based definitions from the
+    # chat model. One LLM call per use, rate-limited per nick.
+    allow_define: bool = True
 
     @field_validator("tick_interval_sec")
     @classmethod

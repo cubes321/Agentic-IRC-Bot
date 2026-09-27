@@ -12,10 +12,12 @@ from typing import Any
 import httpx
 import pydle
 
+from . import prompts
 from .agent import AgentCore
 from .auth import AuthManager
 from .config import Config
 from .db import Database
+from .define import DefineLimiter, clean_reply, parse_word
 from .memory import MemoryWriter
 from .policy import ChannelPolicy
 from .tells import TellStore, human_age
@@ -68,6 +70,7 @@ class IRCBot(pydle.Client):
         self.http = http
         self.q_password = q_password
         self.memory_writer = memory_writer
+        self.define_limiter = DefineLimiter()
         # TaskRunner is wired in main.py after bot construction (chicken-and-egg:
         # TaskRunner needs `bot` to post results; bot needs `task_runner` to
         # dispatch !task commands). Set via `bot.task_runner = ...` post-init.
@@ -344,6 +347,11 @@ class IRCBot(pydle.Client):
             return
         if not is_dm and (cmd_text == "!tell" or cmd_text.startswith("!tell ")):
             asyncio.create_task(self._cmd_tell(target, source, cmd_text))
+            return
+
+        # Joke definitions. Costs one LLM call, but not a full agent turn.
+        if not is_dm and (cmd_text == "!define" or cmd_text.startswith("!define ")):
+            asyncio.create_task(self._cmd_define(target, source, cmd_text))
             return
 
         # Engagement: channel messages need a mention; DMs need to pass the
@@ -819,6 +827,37 @@ class IRCBot(pydle.Client):
             return
 
         await self.irc_send(channel, f"{source}: {result.message}")
+
+    async def _cmd_define(self, channel: str, source: str, cmd_text: str) -> None:
+        """`!define <word>` — a confidently wrong dictionary definition."""
+        ch_cfg = self.cfg.channels.get(channel)
+        if ch_cfg is None or not ch_cfg.allow_define:
+            return
+
+        word = parse_word(cmd_text)
+        if word is None:
+            await self.irc_send(channel, "Usage: !define <word>")
+            return
+
+        if not self.define_limiter.allow(source):
+            await self.irc_send(
+                channel, f"{source}: slow down, the dictionary is still recovering"
+            )
+            return
+
+        try:
+            raw = await self.agent.one_shot(
+                prompts.DEFINE_SYSTEM, word, purpose="define", channel=channel,
+            )
+        except Exception:
+            log.exception("define %r failed", word)
+            raw = None
+
+        reply = clean_reply(word, raw)
+        if reply is None:
+            await self.irc_send(channel, f"{source}: (my dictionary is out to lunch)")
+            return
+        await self.irc_send(channel, f"{source}: {reply}")
 
     async def _cmd_memory_stats(self, channel: str) -> None:
         """Post a quick diagnostic about this channel's memory store. Reads
