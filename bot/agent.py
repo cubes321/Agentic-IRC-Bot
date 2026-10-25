@@ -64,16 +64,17 @@ def _strip_thinking(text: str) -> tuple[str, int]:
 
 # Text-format tool call detection. Some local models emit tool calls as
 # plain text using their training-time format (Hermes XML, Mistral
-# brackets, Qwen flower markers) instead of via the structured tool_calls
-# API. LM Studio's compat adapter doesn't always convert these to the
-# expected shape, so they leak through as plain content. We detect them
-# and treat as a repair-worthy mistake.
+# brackets, Qwen flower markers, LFM special tokens) instead of via the
+# structured tool_calls API. LM Studio's compat adapter doesn't always
+# convert these to the expected shape, so they leak through as plain
+# content. We detect them and treat as a repair-worthy mistake.
 _TEXT_TOOL_CALL_MARKERS = (
     "<tool_call>",        # Hermes / Llama 3.1 / many Qwen variants
     "<function=",         # Hermes function tag, sometimes without <tool_call> wrapper
     "[tool_calls]",       # Mistral
     "✿function✿",         # Qwen2.5 instruct variants
     "✿args✿",
+    "<|tool_call_start|>",  # LFM2 / LFM2.5 (Liquid AI) pythonic list
 )
 
 
@@ -94,7 +95,8 @@ def _looks_like_text_tool_call(text: str) -> bool:
 # the user sees a hint that something was suppressed rather than just
 # missing context.
 _STRIP_TOOL_CALL_RE = _re.compile(
-    r"<tool_call>.*?</tool_call>",
+    r"<tool_call>.*?</tool_call>"
+    r"|<\|tool_call_start\|>.*?<\|tool_call_end\|>",
     flags=_re.IGNORECASE | _re.DOTALL,
 )
 

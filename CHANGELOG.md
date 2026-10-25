@@ -63,6 +63,13 @@ breaking changes freely until a `1.0.0` release).
   `irc_send` mirrors the real one's return-value contract.
 
 ### Fixed
+- Text-format tool calls from LFM2 / LFM2.5 (Liquid AI) models —
+  `<|tool_call_start|>[name(arg='...')]<|tool_call_end|>` — are now
+  recognised. `<|tool_call_start|>` joins `_TEXT_TOOL_CALL_MARKERS`, so
+  the agent loop repairs such a reply instead of posting it, and
+  `_STRIP_TOOL_CALL_RE` removes the block from the budget-summary reply
+  as it already did for Hermes `<tool_call>`. Preventive: no production
+  model emits this format today.
 - Reminders and DMs are no longer silently lost when the IRC
   connection drops mid-send. `IRCBot.irc_send` deliberately does not
   raise on a wire failure — it logs and returns the count of lines
